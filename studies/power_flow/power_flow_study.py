@@ -375,32 +375,20 @@ class PowerFlowStudy:
         """Run Newton-Raphson power flow. Returns True if converged."""
         if self._psse.mock:
             return True
-
         psspy = self._psse.psspy
 
-        # solution_parameters_4 signature for PSSE35:
-        # intgar: 14-element list
-        #   [0] = solution method (0=NR, 1=FDNS, 2=FDXS)
-        #   [1] = tap adjustment (0=off, 1=on)
-        #   [2] = area interchange control (0=off, 1=on)
-        #   [3] = phase shift adjustment (0=off, 1=on)
-        #   [4] = dc tap adjustment (0=off, 1=on)
-        #   [5] = switched shunt adjustment (0=off, 1=on)
-        #   [6] = flat start (0=off, 1=on)
-        #   [7] = var limits (0=apply, 1=ignore)
-        #   [8] = non-divergent solution (0=off, 1=on)
-        #   [9..13] = reserved (0)
-        # realar: 6-element list
-        #   [0] = power mismatch tolerance (pu)
-        #   [1] = voltage mismatch tolerance (pu)
-        #   [2..5] = reserved (0.0)
+        # solution_parameters_4 in PSS/E 35: intgar is exactly 5 elements
+        # [0] = solution method  (0=NR, 1=FDNS, 2=FDXS)
+        # [1] = network formation method
+        # [2] = variable tap adjustment method
+        # [3] = generator reactive control method
+        # [4] = max tap steps per iteration
         psspy.solution_parameters_4(
-            [0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0.0001, 0.0001, 0.0, 0.0, 0.0, 0.0],
+            [0, 0, 0, 0, 0],                              # ✅ 5-element intgar
+            [0.0001, 0.0001, 0.0, 0.0, 0.0, 0.0],         # 6-element realar (unchanged)
         )
 
-        # fnsl: Full Newton-Raphson solve
-        # Options: [tap, area, phase, dcTap, swShunt, flatStart, varLim, nonDiv]
+        # fnsl already handles: tap, area, phase, dcTap, swShunt, flatStart, varLim, nonDiv
         ret = psspy.fnsl([1, 0, 1, 1, 1, 0, 0, 0])
         return ret == 0
 
