@@ -580,6 +580,14 @@ class AESOStudyGUI:
                 f"'{bus_raw}' is not a valid integer bus number.")
             return
 
+        # ── Persist bus number for validate_single_bus.py ─────────────────────
+        _state_file = os.path.join(_ROOT, "gui", ".last_manual_bus")
+        try:
+            with open(_state_file, "w", encoding="utf-8") as _sf:
+                _sf.write(str(bus_no))
+        except OSError as _e:
+            logger.warning("Could not write GUI state file %s: %s", _state_file, _e)
+
         selected = [k for k, v in self.manual_study_vars.items() if v.get()]
         if not selected:
             messagebox.showwarning("No Studies Selected",
@@ -1420,146 +1428,112 @@ class AESOStudyGUI:
                     logger.info("Short Circuit complete.")
 
                 if "transient" in selected_studies:
-                    matrix = self.project.get_study_matrix(sc.scenario_name)
-                    if matrix and (matrix.transient_cat_a or matrix.transient_cat_b
-                                   or matrix.transient_conditional):
-                        logger.info("Running Transient Stability…")
-                        study = TransientStabilityStudy(
-                            psse, self.project, scenario_label=sc.scenario_name,
-                            sim_duration_s=AESO.get("ts_sim_duration_s", 10.0),
-                            fault_apply_time_s=AESO.get("ts_fault_apply_s", 1.0),
-                            rotor_angle_limit_deg=AESO["rotor_angle_limit_deg"],
-                            voltage_recovery_pu=AESO["voltage_recovery_pu"],
-                            voltage_recovery_window_s=AESO["voltage_recovery_time_s"])
-                        study.run(sav_path)
-                        study.save_results(results_dir, plots_dir, reports_dir)
-                        logger.info("Transient Stability complete.")
-                    else:
-                        logger.info("Transient Stability not required for %s.", sc.scenario_name)
+                    logger.info("Running Transient Stability…")
+                    study = TransientStabilityStudy(
+                        psse, self.project, scenario_label=sc.scenario_name,
+                        rotor_angle_limit_deg=AESO["rotor_angle_limit_deg"],
+                        voltage_recovery_pu=AESO["voltage_recovery_pu"],
+                        voltage_recovery_window_s=AESO["voltage_recovery_time_s"])
+                    study.run(sav_path)
+                    study.save_results(results_dir, plots_dir, reports_dir)
+                    logger.info("Transient Stability complete.")
 
                 if "voltage_stability" in selected_studies:
-                    matrix = self.project.get_study_matrix(sc.scenario_name)
-                    if matrix and (matrix.volt_stability_cat_a or matrix.volt_stability_cat_b):
-                        if (self.project.info.source_bus_number
-                                and self.project.info.poi_bus_number):
-                            logger.info("Running PV Voltage Stability…")
-                            study = PVStabilityStudy(
-                                psse, self.project, scenario_label=sc.scenario_name,
-                                v_min_cat_a=AESO["pv_cat_a_v_min"],
-                                v_min_cat_b=AESO["pv_cat_b_v_min"])
-                            study.run(sav_path)
-                            study.save_results(results_dir, plots_dir, reports_dir)
-                            logger.info("PV Voltage Stability complete.")
-                        else:
-                            logger.warning("PV Stability skipped for %s — "
-                                           "Source Bus or POI Bus not set.", sc.scenario_name)
-                    else:
-                        logger.info("PV Stability not required for %s.", sc.scenario_name)
+                    logger.info("Running PV Voltage Stability…")
+                    study = PVStabilityStudy(
+                        psse, self.project, scenario_label=sc.scenario_name,
+                        v_min_cat_a=AESO["pv_cat_a_v_min"],
+                        v_min_cat_b=AESO["pv_cat_b_v_min"])
+                    study.run(sav_path)
+                    study.save_results(results_dir, plots_dir, reports_dir)
+                    logger.info("PV Voltage Stability complete.")
 
-            logger.info("=" * 60)
-            logger.info("All selected studies complete.  Output: %s", output_dir)
-            self.root.after(0, self._on_studies_complete, output_dir)
+            logger.info("All studies complete.")
+            self.root.after(0, self._on_run_complete)
 
         except Exception as exc:
-            logger.error("Study run failed: %s", exc, exc_info=True)
-            self.root.after(0, self._on_studies_failed, str(exc))
+            logger.error("Batch run failed: %s", exc, exc_info=True)
+            self.root.after(0, lambda: self._on_run_error(str(exc)))
 
-    def _on_studies_complete(self, output_dir: str):
-        self.btn_run.configure(state="normal", text="▶  RUN STUDIES")
+    def _on_run_complete(self):
         self.progress_bar.stop()
         self.progress_bar.grid_remove()
-        self.project.output_dir = output_dir
-        for btn in (self.btn_open_results, self.btn_open_plots, self.btn_open_reports):
-            btn.configure(state="normal")
-        self._set_status("✔  Studies completed successfully")
+        self.btn_run.configure(state="normal", text="▶  RUN STUDIES")
+        self.btn_open_results.configure(state="normal")
+        self.btn_open_plots.configure(state="normal")
+        self.btn_open_reports.configure(state="normal")
+        self._set_status("Studies complete — results saved to output/")
         self._refresh_output_tab()
-        self.notebook.select(len(SHEET_TABS) - 1)
         messagebox.showinfo("Studies Complete",
-            f"All selected studies finished successfully.\n\nOutput folder:\n{output_dir}")
+            "All selected studies have finished.\n"
+            "Results are in the output/ folder.")
 
-    def _on_studies_failed(self, error_msg: str):
-        self.btn_run.configure(state="normal", text="▶  RUN STUDIES")
+    def _on_run_error(self, message: str):
         self.progress_bar.stop()
         self.progress_bar.grid_remove()
-        self._set_status("✘  Study run failed — see log for details")
-        messagebox.showerror("Study Run Failed",
-            f"An error occurred during the study run:\n\n{error_msg}\n\n"
-            "Check the log window for details.")
+        self.btn_run.configure(state="normal", text="▶  RUN STUDIES")
+        self._set_status("Run failed — see Study Log")
+        messagebox.showerror("Run Failed",
+            f"The batch run encountered an error:\n\n{message}\n\n"
+            "See the Study Log panel for the full traceback.")
 
-    # ── Output folder helpers ─────────────────────────────────────────────────
-    def _open_subfolder(self, subfolder: str):
-        output_dir = (self.project.output_dir if self.project
-                      else self.var_project_dir.get())
-        if not output_dir:
-            messagebox.showwarning("Not Found", "No output directory configured.")
+    # ── Output folder shortcuts ───────────────────────────────────────────────
+    def _open_subfolder(self, sub: str):
+        if not self.project:
             return
-        target = os.path.join(output_dir, subfolder) if subfolder else output_dir
-        if os.path.isdir(target):
-            subprocess.Popen(f'explorer "{target}"')
-        else:
-            ans = messagebox.askyesno(
-                "Folder Not Found",
-                f"The folder does not exist yet:\n{target}\n\n"
-                "Run studies first to generate output.\n\n"
-                "Open the parent output folder instead?")
-            if ans:
-                os.makedirs(output_dir, exist_ok=True)
-                subprocess.Popen(f'explorer "{output_dir}"')
+        base = getattr(self.project, "output_dir",
+                       os.path.join(self.var_project_dir.get(), "output"))
+        path = os.path.join(base, sub) if sub else base
+        os.makedirs(path, exist_ok=True)
+        try:
+            os.startfile(path)
+        except Exception:
+            subprocess.Popen(["explorer", path])
 
-    # ── Status bar helper ─────────────────────────────────────────────────────
-    def _set_status(self, message: str):
-        self.var_status.set(f"  {message}")
-
-    # ── Logging ───────────────────────────────────────────────────────────────
+    # ── Logging helpers ───────────────────────────────────────────────────────
     def _setup_logging(self):
         handler = QueueHandler(self.log_queue)
         handler.setFormatter(logging.Formatter(
-            "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S"))
-        root_logger = logging.getLogger()
-        root_logger.addHandler(handler)
-        root_logger.setLevel(logging.INFO)
-
-    def _log(self, message: str):
-        self.log_queue.put(message)
+            "%(asctime)s  %(levelname)-8s  %(message)s", "%H:%M:%S"))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.DEBUG)
 
     def _poll_log_queue(self):
-        try:
-            while True:
-                record = self.log_queue.get_nowait()
-                self._append_log(record)
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                msg = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            level = "INFO"
+            for lvl in ("ERROR", "WARNING", "CRITICAL"):
+                if lvl in msg:
+                    level = lvl
+                    break
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", msg + "\n", level)
+            if self._auto_scroll.get():
+                self.log_text.see("end")
+            self.log_text.configure(state="disabled")
         self.root.after(100, self._poll_log_queue)
 
-    def _append_log(self, message: str):
-        self.log_text.configure(state="normal")
-        tag = "INFO"
-        for level in ("CRITICAL", "ERROR", "WARNING"):
-            if level in message:
-                tag = level
-                break
-        self.log_text.insert("end", message + "\n", tag)
-        if self._auto_scroll.get():
-            self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    def _log(self, msg: str):
+        logger.info(msg)
 
     def _clear_log(self):
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
+    def _set_status(self, msg: str):
+        self.var_status.set(msg)
+        self.root.update_idletasks()
 
-# ── Entry point ────────────────────────────────────────────────────────────────
-def launch():
-    try:
-        import tkinter.simpledialog  # noqa: F401
-    except ImportError:
-        print("tkinter not available. Install Python with Tk support.")
-        sys.exit(1)
+
+def main():
     root = tk.Tk()
-    AESOStudyGUI(root)
+    app = AESOStudyGUI(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
-    launch()
+    main()
