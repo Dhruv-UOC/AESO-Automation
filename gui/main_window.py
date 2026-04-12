@@ -1,23 +1,14 @@
 """
-gui/main_window.py (v3.1 — bug-fix release)
+gui/main_window.py (v3.2 — bug-fix release)
 --------------------------------------------
-Fixes applied over v3:
-  Bug 1 — Mock mode checkbox added to Project Setup card; both the batch
-           run thread and the manual study thread now honour var_mock.
-  Bug 2 — psse.initialize() in the manual thread is wrapped in its own
-           try/except so a PSS/E init failure shows a clear message in
-           the result panel instead of an empty panel.
-  Bug 3 — 'from tkinter import simpledialog' added at the top;
-           _new_project() no longer crashes with AttributeError.
-  Bug 4 — Short-circuit bus filter uses getattr(f, 'bus_number',
-           getattr(f, 'bus_no', None)) so the correct attribute is
-           always resolved regardless of naming.
-  Bug 5 — Manual power-flow run logs an info note that a full-system
-           solve is running before the single-bus result is extracted.
-  Bug 6 — _run_manual_study checks self._run_thread.is_alive() and
-           shows a warning if the batch run is in progress.
+Fixes applied over v3.1:
+  Bug 7 — Power flow manual result always showed "Bus not found":
+           getattr(results, 'bus_results', []) was used but
+           PowerFlowResults stores buses in the 'buses' attribute,
+           not 'bus_results'. The getattr fallback silently returned []
+           every time. Fixed to use results.buses directly.
 
-All v3 features retained unchanged.
+All v3.1 fixes retained unchanged.
 """
 
 import logging
@@ -87,7 +78,7 @@ class QueueHandler(logging.Handler):
 
 
 class AESOStudyGUI:
-    """Main application window — responsive layout v3.1."""
+    """Main application window — responsive layout v3.2."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -260,7 +251,7 @@ class AESOStudyGUI:
             font=("Segoe UI", 10))
         self.lbl_project_title.pack(side="right", padx=(8, 0))
 
-        tk.Label(right_hdr, text="v3.1",
+        tk.Label(right_hdr, text="v3.2",
             bg=C_DARK_BLUE, fg="#5580a0",
             font=("Segoe UI", 9)).pack(side="right")
 
@@ -703,12 +694,17 @@ class AESOStudyGUI:
                     _add("header", f"{'─'*42}\n")
                     _add("plain",  f"  Converged: {results.converged}\n")
 
-                    bus_results = [b for b in getattr(results, "bus_results", [])
-                                   if getattr(b, "bus_number", None) == bus_no]
+                    # Bug 7 fix: PowerFlowResults uses 'buses', NOT 'bus_results'
+                    bus_results = [
+                        b for b in results.buses
+                        if b.bus_number == bus_no
+                    ]
                     violation_buses = {v.bus_number for v in results.bus_violations}
 
                     if not bus_results:
-                        _add("muted", "  Bus not found in power flow results.\n")
+                        _add("muted", f"  Bus {bus_no} not found in power flow results.\n")
+                        _add("muted",
+                             f"  (Tip: verify bus {bus_no} exists in the loaded .sav file.)\n")
                     else:
                         _add("plain",
                             f"  {'V (pu)':>8}  {'Angle (°)':>10}  "
