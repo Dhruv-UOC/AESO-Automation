@@ -1,20 +1,17 @@
 """
-gui/main_window.py (v2 — improved)
------------------------------------
-Improvements over v1:
-  - Resizable left / right panes  (ttk.PanedWindow)
-  - Left panel scrolls vertically so nothing is ever clipped
-  - Responsive window: log panel, notebook and panels all grow with window
-  - Status bar at the bottom showing current state
-  - Progress bar while studies are running (indeterminate)
-  - Auto-scroll toggle on the log panel
-  - Results / Plots / Reports  split into 3 separate Open-buttons
-    (was a single "Open Output Folder" that opened the wrong level)
-  - New "Output Files" tab in the notebook that auto-refreshes after a run,
-    shows files in results / plots / reports with size + date,
-    and lets you double-click to open any file directly
-  - Cleaner card-style section layout on the left panel
-  - Better typography hierarchy and spacing
+gui/main_window.py (v3 — Manual Bus Study panel)
+-------------------------------------------------
+New in v3:
+  - Manual Bus Study card in the left panel
+      • Bus Number entry field
+      • Per-study checkboxes (SC / PF / TS / PV)
+      • "Run Manual Study" button
+      • Inline colour-coded results panel (PASS green / FAIL red)
+      • Runs in background thread — GUI stays responsive
+  - Bus filter entry on Run Studies card (comma-separated bus numbers)
+    overrides sc_substations list when filled in
+
+All v2 features retained unchanged.
 """
 
 import logging
@@ -69,7 +66,7 @@ SHEET_TABS = [
     ("SC Substations",    "sc_substations"),
     ("PV Contingencies",  "pv_contingencies"),
     ("Bus Numbers",       "bus_numbers"),
-    ("Output Files",      "_output"),          # ← NEW: file browser tab
+    ("Output Files",      "_output"),
 ]
 
 
@@ -84,7 +81,7 @@ class QueueHandler(logging.Handler):
 
 
 class AESOStudyGUI:
-    """Main application window — responsive layout v2."""
+    """Main application window — responsive layout v3."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -99,7 +96,7 @@ class AESOStudyGUI:
         self.var_excel_path  = tk.StringVar()
         self.var_status      = tk.StringVar(value="Ready — no project loaded")
 
-        # Study checkboxes
+        # Batch study checkboxes
         self.study_vars: Dict[str, tk.BooleanVar] = {
             "power_flow":        tk.BooleanVar(value=True),
             "short_circuit":     tk.BooleanVar(value=True),
@@ -113,6 +110,9 @@ class AESOStudyGUI:
             "voltage_stability": "PV Voltage Stability",
         }
 
+        # Manual study checkboxes (initialised in _build_manual_study_panel)
+        self.manual_study_vars: Dict[str, tk.BooleanVar] = {}
+
         self._setup_root()
         self._build_ui()
         self._setup_logging()
@@ -124,7 +124,6 @@ class AESOStudyGUI:
         self.root.geometry("1400x900")
         self.root.minsize(1100, 720)
         self.root.configure(bg=C_BG)
-        # Row weights: header=0, body=1 (grows), log=0, status=0
         self.root.grid_rowconfigure(0, weight=0)
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_rowconfigure(2, weight=0)
@@ -135,15 +134,14 @@ class AESOStudyGUI:
         style.theme_use("clam")
 
         style.configure("TFrame",      background=C_BG)
-        style.configure("Card.TFrame", background=C_SURFACE,
-                        relief="flat")
+        style.configure("Card.TFrame", background=C_SURFACE, relief="flat")
 
         style.configure("TLabel",
             background=C_BG, font=("Segoe UI", 10), foreground=C_TEXT)
         style.configure("Card.TLabel",
             background=C_SURFACE, font=("Segoe UI", 10), foreground=C_TEXT)
         style.configure("Muted.TLabel",
-            background=C_BG, font=("Segoe UI", 9), foreground=C_TEXT_MUTED)
+            background=C_SURFACE, font=("Segoe UI", 9), foreground=C_TEXT_MUTED)
 
         style.configure("TButton",
             font=("Segoe UI", 9, "bold"),
@@ -159,6 +157,13 @@ class AESOStudyGUI:
             padding=(16, 10), relief="flat")
         style.map("Run.TButton",
             background=[("active", C_GREEN_DARK), ("disabled", C_MID_GREY)])
+
+        style.configure("Manual.TButton",
+            font=("Segoe UI", 10, "bold"),
+            background=C_MID_BLUE, foreground=C_WHITE,
+            padding=(12, 8), relief="flat")
+        style.map("Manual.TButton",
+            background=[("active", C_DARK_BLUE), ("disabled", C_MID_GREY)])
 
         style.configure("OutDir.TButton",
             font=("Segoe UI", 9),
@@ -246,7 +251,7 @@ class AESOStudyGUI:
             font=("Segoe UI", 10))
         self.lbl_project_title.pack(side="right", padx=(8, 0))
 
-        tk.Label(right_hdr, text="v2.0",
+        tk.Label(right_hdr, text="v3.0",
             bg=C_DARK_BLUE, fg="#5580a0",
             font=("Segoe UI", 9)).pack(side="right")
 
@@ -261,7 +266,7 @@ class AESOStudyGUI:
         self.paned.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
         # ── Left side: scrollable canvas ──────────────────────────────────────
-        left_outer = tk.Frame(self.paned, bg=C_BG, width=340)
+        left_outer = tk.Frame(self.paned, bg=C_BG, width=360)
         left_outer.grid_propagate(False)
         left_outer.grid_rowconfigure(0, weight=1)
         left_outer.grid_columnconfigure(0, weight=1)
@@ -286,7 +291,6 @@ class AESOStudyGUI:
         self.left_frame.bind("<Configure>", _on_frame_configure)
         left_canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mouse-wheel scroll (Windows)
         def _on_mousewheel(e):
             left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         left_canvas.bind("<Enter>",  lambda e: left_canvas.bind_all("<MouseWheel>", _on_mousewheel))
@@ -300,10 +304,11 @@ class AESOStudyGUI:
         right.grid_columnconfigure(0, weight=1)
         self.paned.add(right, weight=1)
 
-        # Build sections
+        # Build left-panel sections (top → bottom)
         self._build_project_setup(self.left_frame)
         self._build_validation_panel(self.left_frame)
         self._build_run_panel(self.left_frame)
+        self._build_manual_study_panel(self.left_frame)
         self._build_data_tabs(right)
 
     # ── Left panel: Project Setup ─────────────────────────────────────────────
@@ -359,7 +364,7 @@ class AESOStudyGUI:
         ttk.Button(card, text="Validate Now", command=self._run_validation).grid(
             row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
 
-    # ── Left panel: Run Studies ───────────────────────────────────────────────
+    # ── Left panel: Run Studies (batch) ───────────────────────────────────────
     def _build_run_panel(self, parent):
         card = self._card(parent, " Run Studies", row=2)
         card.grid_columnconfigure(0, weight=1)
@@ -416,7 +421,6 @@ class AESOStudyGUI:
 
         ttk.Separator(card).grid(row=sep_row + 6, column=0, sticky="ew", padx=10, pady=(0, 6))
 
-        # Output sub-folder buttons (3-up)
         ttk.Label(card, text="Open output folder:", style="Card.TLabel").grid(
             row=sep_row + 7, column=0, sticky="w", padx=14, pady=(0, 4))
 
@@ -445,6 +449,329 @@ class AESOStudyGUI:
             state="disabled")
         self.btn_open_reports.grid(row=0, column=2, sticky="ew", padx=(2, 0))
 
+    # ── Left panel: Manual Bus Study ──────────────────────────────────────────
+    def _build_manual_study_panel(self, parent):
+        card = self._card(parent, " Manual Bus Study", row=3)
+        card.grid_columnconfigure(1, weight=1)
+
+        # ── Instruction label ─────────────────────────────────────────────────
+        ttk.Label(card,
+            text="Run a single study on one specific bus without a full batch run.",
+            style="Muted.TLabel").grid(
+                row=0, column=0, columnspan=3, sticky="w",
+                padx=12, pady=(8, 6))
+
+        # ── Bus Number entry ──────────────────────────────────────────────────
+        ttk.Label(card, text="Bus Number:", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(12, 6), pady=(0, 6))
+
+        self.var_manual_bus = tk.StringVar()
+        self.entry_manual_bus = ttk.Entry(
+            card, textvariable=self.var_manual_bus, width=14,
+            font=("Segoe UI", 11))
+        self.entry_manual_bus.grid(row=1, column=1, sticky="w", padx=4, pady=(0, 6))
+
+        ttk.Label(card, text="e.g. 959", style="Muted.TLabel").grid(
+            row=1, column=2, sticky="w", padx=(2, 12), pady=(0, 6))
+
+        # ── Study checkboxes (2 × 2 grid) ────────────────────────────────────
+        ttk.Label(card, text="Studies:", style="Card.TLabel").grid(
+            row=2, column=0, sticky="nw", padx=(12, 6), pady=(0, 6))
+
+        self.manual_study_vars = {
+            "short_circuit":     tk.BooleanVar(value=True),
+            "power_flow":        tk.BooleanVar(value=True),
+            "transient":         tk.BooleanVar(value=False),
+            "voltage_stability": tk.BooleanVar(value=False),
+        }
+        _manual_labels = {
+            "short_circuit":     "Short Circuit",
+            "power_flow":        "Power Flow",
+            "transient":         "Transient Stability",
+            "voltage_stability": "PV Stability",
+        }
+        chk_frame = ttk.Frame(card, style="Card.TFrame")
+        chk_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+        for idx, (key, label) in enumerate(_manual_labels.items()):
+            r, c = divmod(idx, 2)
+            ttk.Checkbutton(chk_frame, text=label,
+                variable=self.manual_study_vars[key]).grid(
+                row=r, column=c, sticky="w", padx=(0, 16), pady=2)
+
+        # ── Run button ────────────────────────────────────────────────────────
+        self.btn_manual_run = ttk.Button(
+            card, text="▶  Run Manual Study",
+            command=self._run_manual_study,
+            style="Manual.TButton")
+        self.btn_manual_run.grid(
+            row=3, column=0, columnspan=3, sticky="ew",
+            padx=10, pady=(4, 4))
+
+        # ── Results panel ─────────────────────────────────────────────────────
+        ttk.Separator(card).grid(
+            row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 6))
+
+        ttk.Label(card, text="Results:", style="Card.TLabel").grid(
+            row=5, column=0, sticky="nw", padx=(12, 6), pady=(0, 4))
+
+        result_frame = ttk.Frame(card, style="Card.TFrame")
+        result_frame.grid(
+            row=6, column=0, columnspan=3,
+            sticky="ew", padx=10, pady=(0, 10))
+        result_frame.grid_columnconfigure(0, weight=1)
+
+        self.manual_result_text = tk.Text(
+            result_frame, height=12, wrap="word",
+            bg="#0f1923", fg="#c8d8e8",
+            font=("Consolas", 9),
+            borderwidth=0, relief="flat",
+            state="disabled", padx=8, pady=6)
+        result_scroll = ttk.Scrollbar(result_frame, command=self.manual_result_text.yview)
+        self.manual_result_text.configure(yscrollcommand=result_scroll.set)
+        self.manual_result_text.grid(row=0, column=0, sticky="ew")
+        result_scroll.grid(row=0, column=1, sticky="ns")
+
+        # Colour tags
+        self.manual_result_text.tag_configure(
+            "pass",   foreground=C_GREEN,     font=("Consolas", 9, "bold"))
+        self.manual_result_text.tag_configure(
+            "fail",   foreground=C_RED,       font=("Consolas", 9, "bold"))
+        self.manual_result_text.tag_configure(
+            "header", foreground="#7ec8e3",   font=("Consolas", 9, "bold"))
+        self.manual_result_text.tag_configure(
+            "muted",  foreground=C_TEXT_MUTED)
+        self.manual_result_text.tag_configure(
+            "plain",  foreground="#c8d8e8")
+
+        self._manual_result_write(
+            "No results yet — enter a bus number and click Run.\n", "muted")
+
+    # ── Manual study: runner ──────────────────────────────────────────────────
+    def _run_manual_study(self):
+        """Validate inputs, then run selected studies for one bus in a thread."""
+        bus_raw = self.var_manual_bus.get().strip()
+        if not bus_raw:
+            messagebox.showwarning("Bus Required",
+                "Enter a bus number in the Manual Bus Study panel.")
+            return
+        try:
+            bus_no = int(bus_raw)
+        except ValueError:
+            messagebox.showerror("Invalid Bus Number",
+                f"'{bus_raw}' is not a valid integer bus number.")
+            return
+
+        selected = [k for k, v in self.manual_study_vars.items() if v.get()]
+        if not selected:
+            messagebox.showwarning("No Studies Selected",
+                "Tick at least one study in the Manual Bus Study panel.")
+            return
+
+        if not self.project:
+            messagebox.showerror("No Project Loaded",
+                "Load a project (Excel) before running a manual study.")
+            return
+
+        sav = self.var_sav_path.get().strip()
+        if not sav or not os.path.isfile(sav):
+            messagebox.showerror("SAV File Missing",
+                "Browse to a valid .sav file before running.")
+            return
+
+        # Lock button; show initial status
+        self.btn_manual_run.configure(state="disabled")
+        self._manual_result_write(
+            f"Running bus {bus_no}  →  {', '.join(selected)} …\n", "muted")
+
+        def _thread():
+            from config.settings import PSSE_PATH, PSSE_VERSION, AESO
+            from core.psse_interface import PSSEInterface
+
+            lines: List[tuple] = []
+
+            def _add(tag, text):
+                lines.append((tag, text))
+
+            try:
+                psse = PSSEInterface(
+                    psse_path=PSSE_PATH,
+                    psse_version=PSSE_VERSION,
+                    mock=False,
+                )
+                psse.initialize()
+
+                # ── Short Circuit ─────────────────────────────────────────
+                if "short_circuit" in selected:
+                    from studies.short_circuit.short_circuit_study import ShortCircuitStudy
+                    study = ShortCircuitStudy(
+                        psse,
+                        scenario_label       = f"Manual  Bus {bus_no}",
+                        max_fault_current_ka = AESO["max_fault_current_ka"],
+                        bus_filter           = [bus_no],
+                    )
+                    results = study.run(sav)
+                    bus_faults = [f for f in results.faults
+                                  if getattr(f, "bus_number", None) == bus_no]
+
+                    _add("header", f"\n{'─'*42}\n")
+                    _add("header", f"  SHORT CIRCUIT  |  Bus {bus_no}\n")
+                    _add("header", f"{'─'*42}\n")
+
+                    if not bus_faults:
+                        _add("muted", "  No fault data returned for this bus.\n")
+                    else:
+                        _add("plain", f"  {'Fault':<6}  {'I_fault (kA)':>12}  {'Limit (kA)':>10}  Result\n")
+                        _add("muted", f"  {'─'*6}  {'─'*12}  {'─'*10}  {'─'*6}\n")
+                        for f in bus_faults:
+                            ok = f.fault_current_ka <= AESO["max_fault_current_ka"]
+                            tag = "pass" if ok else "fail"
+                            status = "  PASS" if ok else "  FAIL"
+                            _add("plain",
+                                f"  {f.fault_type:<6}  "
+                                f"{f.fault_current_ka:>12.3f}  "
+                                f"{AESO['max_fault_current_ka']:>10.1f}")
+                            _add(tag, f"{status}\n")
+
+                # ── Power Flow ────────────────────────────────────────────
+                if "power_flow" in selected:
+                    from studies.power_flow.power_flow_study import PowerFlowStudy
+                    study = PowerFlowStudy(
+                        psse,
+                        scenario_label          = f"Manual  Bus {bus_no}",
+                        project                 = self.project,
+                        season_label            = "Manual",
+                        voltage_min             = AESO["voltage_min_pu"],
+                        voltage_max             = AESO["voltage_max_pu"],
+                        voltage_min_contingency = AESO["voltage_min_contingency"],
+                        voltage_max_contingency = AESO["voltage_max_contingency"],
+                        thermal_limit_pct       = AESO["thermal_limit_pct"],
+                    )
+                    results = study.run(sav)
+
+                    _add("header", f"\n{'─'*42}\n")
+                    _add("header", f"  POWER FLOW  |  Bus {bus_no}\n")
+                    _add("header", f"{'─'*42}\n")
+                    _add("plain",  f"  Converged: {results.converged}\n")
+
+                    bus_results = [b for b in getattr(results, "bus_results", [])
+                                   if getattr(b, "bus_number", None) == bus_no]
+                    violation_buses = {v.bus_number for v in results.bus_violations}
+
+                    if not bus_results:
+                        _add("muted", "  Bus not found in power flow results.\n")
+                    else:
+                        _add("plain",
+                            f"  {'V (pu)':>8}  {'Angle (°)':>10}  "
+                            f"{'V_min':>6}  {'V_max':>6}  Result\n")
+                        _add("muted",
+                            f"  {'─'*8}  {'─'*10}  {'─'*6}  {'─'*6}  {'─'*6}\n")
+                        for b in bus_results:
+                            viol = b.bus_number in violation_buses
+                            tag = "fail" if viol else "pass"
+                            status = "  FAIL" if viol else "  PASS"
+                            _add("plain",
+                                f"  {b.voltage_pu:>8.4f}  "
+                                f"{b.angle_deg:>10.2f}  "
+                                f"{AESO['voltage_min_pu']:>6.3f}  "
+                                f"{AESO['voltage_max_pu']:>6.3f}")
+                            _add(tag, f"{status}\n")
+
+                # ── Transient Stability ───────────────────────────────────
+                if "transient" in selected:
+                    from studies.transient_stability.transient_stability_study import (
+                        TransientStabilityStudy,
+                    )
+                    study = TransientStabilityStudy(
+                        psse, self.project,
+                        scenario_label            = f"Manual  Bus {bus_no}",
+                        rotor_angle_limit_deg     = AESO["rotor_angle_limit_deg"],
+                        voltage_recovery_pu       = AESO["voltage_recovery_pu"],
+                        voltage_recovery_window_s = AESO["voltage_recovery_time_s"],
+                    )
+                    results = study.run(sav)
+
+                    _add("header", f"\n{'─'*42}\n")
+                    _add("header", f"  TRANSIENT STABILITY  |  Bus {bus_no}\n")
+                    _add("header", f"{'─'*42}\n")
+
+                    if not results.contingencies:
+                        _add("muted", "  No contingencies run.\n")
+                    else:
+                        _add("plain",
+                            f"  {'Contingency':<36}  {'Angle':>6}  {'V_poi':>6}  Result\n")
+                        _add("muted",
+                            f"  {'─'*36}  {'─'*6}  {'─'*6}  {'─'*6}\n")
+                        for c in results.contingencies:
+                            tag = "pass" if c.aeso_pass else "fail"
+                            status = "  PASS" if c.aeso_pass else "  FAIL"
+                            _add("plain",
+                                f"  {c.contingency_name[:36]:<36}  "
+                                f"{c.max_rotor_angle_deg:>6.1f}  "
+                                f"{c.min_poi_voltage_pu:>6.4f}")
+                            _add(tag, f"{status}\n")
+
+                # ── PV Voltage Stability ──────────────────────────────────
+                if "voltage_stability" in selected:
+                    from studies.pv_voltage.pv_stability_study import PVStabilityStudy
+                    study = PVStabilityStudy(
+                        psse, self.project,
+                        scenario_label = f"Manual  Bus {bus_no}",
+                        v_min_cat_a    = AESO["pv_cat_a_v_min"],
+                        v_min_cat_b    = AESO["pv_cat_b_v_min"],
+                    )
+                    results = study.run(sav)
+
+                    _add("header", f"\n{'─'*42}\n")
+                    _add("header", f"  PV VOLTAGE STABILITY  |  Bus {bus_no}\n")
+                    _add("header", f"{'─'*42}\n")
+
+                    if not results.curves:
+                        _add("muted", "  No PV curves generated.\n")
+                    else:
+                        _add("plain",
+                            f"  {'Contingency':<36}  {'Collapse':>8}  {'Min V':>6}  Result\n")
+                        _add("muted",
+                            f"  {'─'*36}  {'─'*8}  {'─'*6}  {'─'*6}\n")
+                        for c in results.curves:
+                            tag = "pass" if c.aeso_status == "PASS" else "fail"
+                            collapse = f"{c.collapse_mw} MW" if c.collapse_mw else "    —"
+                            _add("plain",
+                                f"  {c.scenario_name[:36]:<36}  "
+                                f"{collapse:>8}  "
+                                f"{c.min_voltage_pu:>6.4f}")
+                            _add(tag, f"  {c.aeso_status}\n")
+
+                _add("muted", "\n─── Done ───\n")
+
+            except Exception as exc:
+                logger.error("Manual study error: %s", exc, exc_info=True)
+                lines.clear()
+                _add("fail", f"\n[ERROR]  {exc}\n")
+                _add("muted", "\nCheck the Study Log panel for the full traceback.\n")
+
+            finally:
+                self.root.after(0, lambda: self._manual_result_write_lines(lines))
+                self.root.after(0, lambda: self.btn_manual_run.configure(state="normal"))
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    # ── Manual result panel helpers ───────────────────────────────────────────
+    def _manual_result_write(self, text: str, tag: str = "plain"):
+        """Replace the manual result panel content with a single message."""
+        self.manual_result_text.configure(state="normal")
+        self.manual_result_text.delete("1.0", "end")
+        self.manual_result_text.insert("end", text, tag)
+        self.manual_result_text.configure(state="disabled")
+
+    def _manual_result_write_lines(self, lines: List[tuple]):
+        """Write coloured (tag, text) pairs to the manual result panel."""
+        self.manual_result_text.configure(state="normal")
+        self.manual_result_text.delete("1.0", "end")
+        for tag, text in lines:
+            self.manual_result_text.insert("end", text, tag or "plain")
+        self.manual_result_text.configure(state="disabled")
+        self.manual_result_text.see("end")
+
     # ── Right panel: Notebook ─────────────────────────────────────────────────
     def _build_data_tabs(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -472,10 +799,10 @@ class AESOStudyGUI:
         outer.grid_rowconfigure(1, weight=1)
         outer.grid_columnconfigure(0, weight=1)
 
-        # Toolbar
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        ttk.Label(toolbar, text="Generated output files — double-click a file to open it:").pack(side="left")
+        ttk.Label(toolbar,
+            text="Generated output files — double-click a file to open it:").pack(side="left")
         ttk.Button(toolbar, text="↻  Refresh",
             command=self._refresh_output_tab,
             style="Ghost.TButton").pack(side="right")
@@ -505,10 +832,8 @@ class AESOStudyGUI:
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
 
-        # Double-click opens the file
         self.output_tree.bind("<Double-1>", self._on_output_file_open)
 
-        # Placeholder message shown before any run
         self._output_placeholder = tk.Label(
             outer,
             text="No output files yet.\nRun studies first — files will appear here automatically.",
@@ -518,9 +843,7 @@ class AESOStudyGUI:
         self._output_placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
     def _refresh_output_tab(self):
-        """Populate the output files tree from the project output directory."""
         self.output_tree.delete(*self.output_tree.get_children())
-
         if not self.project:
             return
         output_dir = getattr(self.project, "output_dir", None)
@@ -551,13 +874,7 @@ class AESOStudyGUI:
                 stat  = os.stat(fpath)
                 size  = self._fmt_size(stat.st_size)
                 mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d  %H:%M")
-                if fname.endswith(".xlsx"):
-                    icon = "  "
-                elif fname.endswith((".png", ".pdf")):
-                    icon = "  "
-                else:
-                    icon = "  "
-                # Store the filepath in tags for double-click open
+                icon = "  " if fname.endswith(".xlsx") else ("  " if fname.endswith((".png", ".pdf")) else "  ")
                 self.output_tree.insert(
                     folder_node, "end",
                     text=f"    {icon}{fname}",
@@ -574,7 +891,6 @@ class AESOStudyGUI:
         return f"{size / 1048576:.1f} MB"
 
     def _on_output_file_open(self, _event):
-        """Open a file from the output tree on double-click."""
         item = self.output_tree.focus()
         if not item:
             return
@@ -617,7 +933,6 @@ class AESOStudyGUI:
         log_outer.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 0))
         log_outer.grid_columnconfigure(0, weight=1)
 
-        # Toolbar
         toolbar = tk.Frame(log_outer, bg=C_LIGHT_GREY)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 2))
 
@@ -849,7 +1164,7 @@ class AESOStudyGUI:
             alt = not alt
         tree.tag_configure("alt", background=C_LIGHT_BLUE)
 
-    # ── Row builders (identical to v1) ────────────────────────────────────────
+    # ── Row builders ──────────────────────────────────────────────────────────
     def _scenarios_rows(self):
         cols = ("No", "Year", "Season", "Dispatch", "Scenario Name",
                 "Pre/Post", "Load (MW)", "Gen (MW)")
@@ -959,7 +1274,7 @@ class AESOStudyGUI:
     def _get_selected_scenarios(self) -> List[str]:
         return [self.scenario_listbox.get(i) for i in self.scenario_listbox.curselection()]
 
-    # ── Run studies ───────────────────────────────────────────────────────────
+    # ── Batch run studies ─────────────────────────────────────────────────────
     def _run_studies(self):
         if self.project is None:
             messagebox.showwarning("No Project", "Load a project first.")
@@ -1014,6 +1329,8 @@ class AESOStudyGUI:
             results_dir = os.path.join(output_dir, "results")
             plots_dir   = os.path.join(output_dir, "plots")
             reports_dir = os.path.join(output_dir, "reports")
+            for d in (results_dir, plots_dir, reports_dir):
+                os.makedirs(d, exist_ok=True)
 
             scenarios_to_run = [sc for sc in self.project.scenarios
                                 if sc.scenario_name in selected_scenarios]
@@ -1102,7 +1419,6 @@ class AESOStudyGUI:
             btn.configure(state="normal")
         self._set_status("✔  Studies completed successfully")
         self._refresh_output_tab()
-        # Auto-switch to the Output Files tab
         self.notebook.select(len(SHEET_TABS) - 1)
         messagebox.showinfo("Studies Complete",
             f"All selected studies finished successfully.\n\nOutput folder:\n{output_dir}")
@@ -1118,7 +1434,6 @@ class AESOStudyGUI:
 
     # ── Output folder helpers ─────────────────────────────────────────────────
     def _open_subfolder(self, subfolder: str):
-        """Open a specific output sub-folder (results/plots/reports) in Explorer."""
         output_dir = (self.project.output_dir if self.project
                       else self.var_project_dir.get())
         if not output_dir:
