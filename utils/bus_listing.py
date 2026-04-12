@@ -27,7 +27,7 @@ Usage
     python utils/bus_listing.py
 
     # With explicit paths:
-    python utils/bus_listing.py --sav D:\\...\\cases\\sample.sav
+    python utils/bus_listing.py --sav D:\\Final_Project\\files\\Projects\\P2611\\Cases\\2029SW_SP_HR.sav
                                 --output D:\\...\\output\\results
 
     # Filter by substation name (partial match, case-insensitive):
@@ -55,6 +55,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# ── USER CONFIGURATION ────────────────────────────────────────────────────────
+# Set your .sav file path here — this will be used if no --sav flag is provided
+USER_SAV_FILE = r"D:\Final_Project\files\Projects\P1828\cases\2021RC_2025SP_South-High_Tie-Econ_Solar-0.95_p.sav"
+# Example alternatives:
+#   r"D:\Final_Project\files\Projects\P1828\cases\2021RC_2025SP_South-High_Tie-Econ_Solar-0.95_p.sav"
+#   r"D:\Final_Project\files\cases\sample.sav"
 
 
 # ── Data container ────────────────────────────────────────────────────────────
@@ -551,9 +558,9 @@ def main() -> int:
     args   = parser.parse_args()
 
     # Import settings
-    from config.settings import PSSE_PATH, PSSE_VERSION, DEFAULT_SAV, RESULTS_DIR
+    from config.settings import PSSE_PATH, PSSE_VERSION, RESULTS_DIR
 
-    sav_path   = args.sav    or DEFAULT_SAV
+    sav_path   = args.sav    or USER_SAV_FILE
     output_dir = args.output or RESULTS_DIR
 
     logger.info("PSS/E path  : %s", PSSE_PATH)
