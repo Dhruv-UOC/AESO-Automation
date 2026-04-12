@@ -1,17 +1,23 @@
 """
-gui/main_window.py (v3 — Manual Bus Study panel)
--------------------------------------------------
-New in v3:
-  - Manual Bus Study card in the left panel
-      • Bus Number entry field
-      • Per-study checkboxes (SC / PF / TS / PV)
-      • "Run Manual Study" button
-      • Inline colour-coded results panel (PASS green / FAIL red)
-      • Runs in background thread — GUI stays responsive
-  - Bus filter entry on Run Studies card (comma-separated bus numbers)
-    overrides sc_substations list when filled in
+gui/main_window.py (v3.1 — bug-fix release)
+--------------------------------------------
+Fixes applied over v3:
+  Bug 1 — Mock mode checkbox added to Project Setup card; both the batch
+           run thread and the manual study thread now honour var_mock.
+  Bug 2 — psse.initialize() in the manual thread is wrapped in its own
+           try/except so a PSS/E init failure shows a clear message in
+           the result panel instead of an empty panel.
+  Bug 3 — 'from tkinter import simpledialog' added at the top;
+           _new_project() no longer crashes with AttributeError.
+  Bug 4 — Short-circuit bus filter uses getattr(f, 'bus_number',
+           getattr(f, 'bus_no', None)) so the correct attribute is
+           always resolved regardless of naming.
+  Bug 5 — Manual power-flow run logs an info note that a full-system
+           solve is running before the single-bus result is extracted.
+  Bug 6 — _run_manual_study checks self._run_thread.is_alive() and
+           shows a warning if the batch run is in progress.
 
-All v2 features retained unchanged.
+All v3 features retained unchanged.
 """
 
 import logging
@@ -21,7 +27,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk   # Bug 3 fix
 from typing import Dict, List, Optional
 
 # ── Ensure project root is on path ────────────────────────────────────────────
@@ -81,7 +87,7 @@ class QueueHandler(logging.Handler):
 
 
 class AESOStudyGUI:
-    """Main application window — responsive layout v3."""
+    """Main application window — responsive layout v3.1."""
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -95,6 +101,9 @@ class AESOStudyGUI:
         self.var_sav_path    = tk.StringVar()
         self.var_excel_path  = tk.StringVar()
         self.var_status      = tk.StringVar(value="Ready — no project loaded")
+
+        # Bug 1 fix: mock mode toggle
+        self.var_mock = tk.BooleanVar(value=False)
 
         # Batch study checkboxes
         self.study_vars: Dict[str, tk.BooleanVar] = {
@@ -251,7 +260,7 @@ class AESOStudyGUI:
             font=("Segoe UI", 10))
         self.lbl_project_title.pack(side="right", padx=(8, 0))
 
-        tk.Label(right_hdr, text="v3.0",
+        tk.Label(right_hdr, text="v3.1",
             bg=C_DARK_BLUE, fg="#5580a0",
             font=("Segoe UI", 9)).pack(side="right")
 
@@ -330,8 +339,17 @@ class AESOStudyGUI:
             ttk.Button(card, text="Browse…", command=cmd, width=8).grid(
                 row=i, column=2, padx=(4, 10), pady=(pad_top, 4))
 
+        # Bug 1 fix: Mock mode checkbox
+        mock_row = ttk.Frame(card, style="Card.TFrame")
+        mock_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 4))
+        ttk.Checkbutton(
+            mock_row,
+            text="Mock PSS/E mode (no licence required — for testing)",
+            variable=self.var_mock,
+        ).pack(side="left")
+
         btn_row = ttk.Frame(card, style="Card.TFrame")
-        btn_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
+        btn_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
         btn_row.grid_columnconfigure((0, 1, 2), weight=1)
         for col, (text, cmd) in enumerate([
             ("New Project", self._new_project),
@@ -549,6 +567,16 @@ class AESOStudyGUI:
     # ── Manual study: runner ──────────────────────────────────────────────────
     def _run_manual_study(self):
         """Validate inputs, then run selected studies for one bus in a thread."""
+
+        # Bug 6 fix: guard against concurrent batch run
+        if self._run_thread and self._run_thread.is_alive():
+            messagebox.showwarning(
+                "Batch Run in Progress",
+                "A batch study is already running.\n"
+                "Please wait for it to finish before starting a manual study."
+            )
+            return
+
         bus_raw = self.var_manual_bus.get().strip()
         if not bus_raw:
             messagebox.showwarning("Bus Required",
@@ -583,6 +611,9 @@ class AESOStudyGUI:
         self._manual_result_write(
             f"Running bus {bus_no}  →  {', '.join(selected)} …\n", "muted")
 
+        # Bug 1 fix: read mock flag once before spawning thread
+        use_mock = self.var_mock.get()
+
         def _thread():
             from config.settings import PSSE_PATH, PSSE_VERSION, AESO
             from core.psse_interface import PSSEInterface
@@ -596,9 +627,18 @@ class AESOStudyGUI:
                 psse = PSSEInterface(
                     psse_path=PSSE_PATH,
                     psse_version=PSSE_VERSION,
-                    mock=False,
+                    mock=use_mock,   # Bug 1 fix: honour mock flag
                 )
-                psse.initialize()
+
+                # Bug 2 fix: wrap initialize() separately for a clear error
+                try:
+                    psse.initialize()
+                except Exception as init_exc:
+                    _add("fail", f"\n[PSS/E INIT ERROR]  {init_exc}\n")
+                    _add("muted",
+                         "\nCheck PSSE_PATH in config/settings.py, "
+                         "or enable Mock PSS/E mode in Project Setup.\n")
+                    return   # jumps to finally
 
                 # ── Short Circuit ─────────────────────────────────────────
                 if "short_circuit" in selected:
@@ -610,8 +650,12 @@ class AESOStudyGUI:
                         bus_filter           = [bus_no],
                     )
                     results = study.run(sav)
-                    bus_faults = [f for f in results.faults
-                                  if getattr(f, "bus_number", None) == bus_no]
+
+                    # Bug 4 fix: resolve attribute with fallback
+                    bus_faults = [
+                        f for f in results.faults
+                        if getattr(f, "bus_number", getattr(f, "bus_no", None)) == bus_no
+                    ]
 
                     _add("header", f"\n{'─'*42}\n")
                     _add("header", f"  SHORT CIRCUIT  |  Bus {bus_no}\n")
@@ -635,6 +679,12 @@ class AESOStudyGUI:
                 # ── Power Flow ────────────────────────────────────────────
                 if "power_flow" in selected:
                     from studies.power_flow.power_flow_study import PowerFlowStudy
+
+                    # Bug 5 fix: inform user that a full solve is running
+                    _add("muted",
+                         f"\n  [Info] Running full-system power flow to extract "
+                         f"Bus {bus_no} result…\n")
+
                     study = PowerFlowStudy(
                         psse,
                         scenario_label          = f"Manual  Bus {bus_no}",
@@ -1025,7 +1075,8 @@ class AESOStudyGUI:
         parent_dir = filedialog.askdirectory(title="Select Parent Folder for New Project")
         if not parent_dir:
             return
-        project_num = tk.simpledialog.askstring(
+        # Bug 3 fix: use imported simpledialog (not tk.simpledialog)
+        project_num = simpledialog.askstring(
             "New Project", "Enter project number (e.g. P2611):", parent=self.root)
         if not project_num:
             return
@@ -1305,13 +1356,16 @@ class AESOStudyGUI:
         self.project.project_dir = self.var_project_dir.get()
         self.project.output_dir  = os.path.join(self.project.project_dir, "output")
 
+        # Bug 1 fix: read mock flag before spawning thread
+        use_mock = self.var_mock.get()
+
         self._run_thread = threading.Thread(
             target=self._run_studies_thread,
-            args=(sav_path, selected_scenarios, selected_studies),
+            args=(sav_path, selected_scenarios, selected_studies, use_mock),
             daemon=True)
         self._run_thread.start()
 
-    def _run_studies_thread(self, sav_path, selected_scenarios, selected_studies):
+    def _run_studies_thread(self, sav_path, selected_scenarios, selected_studies, use_mock):
         try:
             from config.settings import PSSE_PATH, PSSE_VERSION, AESO
             from core.psse_interface import PSSEInterface
@@ -1320,8 +1374,12 @@ class AESOStudyGUI:
             from studies.transient_stability.transient_stability_study import TransientStabilityStudy
             from studies.pv_voltage.pv_stability_study import PVStabilityStudy
 
-            logger.info("Initialising PSS/E (version %d)…", PSSE_VERSION)
-            psse = PSSEInterface(psse_path=PSSE_PATH, psse_version=PSSE_VERSION, mock=False)
+            logger.info("Initialising PSS/E (version %d, mock=%s)…", PSSE_VERSION, use_mock)
+            psse = PSSEInterface(
+                psse_path=PSSE_PATH,
+                psse_version=PSSE_VERSION,
+                mock=use_mock,   # Bug 1 fix: honour mock flag
+            )
             psse.initialize()
             logger.info("PSS/E initialised.")
 
