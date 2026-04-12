@@ -1,0 +1,24 @@
+Version 33 
+@! 
+@! STAGE 2 Project Data Update Package: P1838
+@! =============================================================================================================================
+@! Created by CW, Altalink 
+@! Created on March 14, 2017 
+@!
+@! P1838 22.0 MW Solar Generation (GY) Suffield 895S (bus# 3270)
+@! Fortis 25 kV feeder impedance z+ = 0.0544 + 0.0933j pu/km; z0 = 0.1611 + 0.33j pu/km
+@! Fortis 25 kV feeder length = 12.0 km  
+@! 
+RESQ
+1
+1
+  3270,'GY', 0.00000E+00, 9.99900E+03, 9.99900E+03, 9.99900E+03, 0.00000E+00, 9.99900E+03, 0.00000E+00, 9.99900E+03,1, 0.00000E+00, 0.00000E+00
+0  / END OF MACHINE IMPEDANCE DATA, BEGIN LOAD DATA
+0  / END OF LOAD DATA, BEGIN ZERO SEQ. NON-TRANSFORMER BRANCH DATA
+0  / END OF ZERO SEQ. NON-TRANSFORMER BRANCH DATA, BEGIN ZERO SEQ. MUTUAL DATA
+0  / END OF ZERO SEQ. MUTUAL DATA, BEGIN ZERO SEQ. TRANSFORMER DATA
+0  / END OF ZERO SEQ. TRANSFORMER DATA, BEGIN ZERO SEQ. SWITCHED SHUNT DATA
+0  / END OF ZERO SEQ. SWITCHED SHUNT DATA, BEGIN ZERO SEQ. FIXED SHUNT DATA
+0  / END OF ZERO SEQ. FIXED SHUNT DATA, BEGIN INDUCTION MACHINE DATA
+0  / END OF INDUCTION MACHINE DATA
+Q
