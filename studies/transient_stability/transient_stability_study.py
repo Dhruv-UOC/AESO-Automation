@@ -6,21 +6,41 @@ Automates AESO Transient Stability Analysis (Phase 3) using PSS/E via psspy.
 Workflow
 --------
 1.  Load base case (.sav) — power flow snapshot
-2.  Load dynamic models (.dyr) — machine models, AVRs, PSS, etc.
-3.  Solve base case Newton-Raphson power flow
-4.  For each contingency in TS_Contingencies:
+2.  Convert network for dynamics  (conl → cong → ordr → fact → tysl)
+    This allocates PSS/E's internal CON/STATE/VAR arrays.  DYRE_NEW will
+    fail with "Invalid starting CON index: 0" if this step is skipped.
+3.  Load dynamic models (.dyr) via psspy.dyre_new()
+4.  Set up output channels (voltage, rotor angle, active/reactive power)
+5.  Initialise dynamic simulation (psspy.strt)
+6.  For each contingency in TS_Contingencies:
     a. Reload fresh .sav
-    b. Reload .dyr (dynamics must be re-loaded after each psspy.case() call)
-    c. Set up output channels (voltage, rotor angle, active/reactive power)
-    d. Initialise dynamic simulation (psspy.strt)
-    e. Run pre-fault simulation to steady state (t=0 to fault_apply_time)
-    f. Apply bolted 3-phase fault at contingency bus
-    g. Run during-fault simulation (fault_apply_time to fault_clear_time)
-    h. Clear fault (restore branch)
-    i. Run post-fault simulation (fault_clear_time to sim_end)
-    j. Extract channel data: bus voltages, rotor angles, active/reactive power
-    k. Check AESO criteria: rotor angle stability, voltage recovery
-5.  Export results to Excel + multi-panel PNG plots + PDF report
+    b. Re-run conversion sequence  (Steps 2 above)
+    c. Reload .dyr  (Step 3 above)
+    d. Set up output channels
+    e. Initialise dynamic simulation (psspy.strt)
+    f. Run pre-fault simulation to steady state (t=0 to fault_apply_time)
+    g. Apply bolted 3-phase fault at contingency bus
+    h. Run during-fault simulation (fault_apply_time to fault_clear_time)
+    i. Clear fault (restore branch)
+    j. Run post-fault simulation (fault_clear_time to sim_end)
+    k. Extract channel data: bus voltages, rotor angles, active/reactive power
+    l. Check AESO criteria: rotor angle stability, voltage recovery
+7.  Export results to Excel + multi-panel PNG plots + PDF report
+
+Root cause of "Invalid starting CON index: 0"  (PSS/E message 001544)
+----------------------------------------------------------------------
+PSS/E's dynamic simulation requires internal arrays (CON, STATE, VAR) to be
+allocated before any dynamic data can be read.  These arrays are allocated by
+the network-conversion activities:
+    conl  – converts load models
+    cong  – converts generator models
+    ordr  – orders the network for dynamics
+    fact  – factorises the network matrix
+    tysl  – solves the initial-conditions power flow
+
+Calling psspy.dyre_new() before these four steps leaves the CON array at its
+default starting index of 0, which PSS/E rejects.  The fix is to run the full
+conversion sequence every time a fresh .sav is loaded — before dyre_new().
 
 AESO Criteria Applied (Study Scope Section 5.3 and Requirements doc Section 3.4)
 ----------------------------------------------------------------------------------
@@ -67,7 +87,7 @@ from project_io.project_data import ProjectData, TSContingency
 
 logger = logging.getLogger(__name__)
 
-# ── AESO colour palette ───────────────────────────────────────────────────────────────────
+# ── AESO colour palette ───────────────────────────────────────────────────────
 _BLUE   = "#003865"
 _RED    = "#C8102E"
 _ORANGE = "#E87722"
@@ -90,7 +110,7 @@ plt.rcParams.update({
 })
 
 
-# ── Data containers ──────────────────────────────────────────────────────────────────
+# ── Data containers ───────────────────────────────────────────────────────────
 
 @dataclass
 class ChannelData:
@@ -146,7 +166,7 @@ class TransientStabilityResults:
         return sum(1 for c in self.contingencies if not c.aeso_pass)
 
 
-# ── Study class ───────────────────────────────────────────────────────────────────
+# ── Study class ───────────────────────────────────────────────────────────────
 
 class TransientStabilityStudy:
     """
@@ -307,27 +327,102 @@ class TransientStabilityStudy:
 
         return {"excel": excel_path, "plots": plot_paths, "pdf": pdf_path}
 
-    # ── Private: PSS/E transient stability engine ─────────────────────────────────
+    # ── Private: PSS/E transient stability engine ─────────────────────────────
+
+    def _convert_for_dynamics(self, psspy) -> bool:
+        """
+        Run the PSS/E network-conversion sequence required before dyre_new().
+
+        PSS/E allocates its internal CON, STATE, and VAR arrays only after the
+        following four activities have been executed in order:
+
+            conl  – step 1/3 of load model conversion (constant-power portion)
+            cong  – converts generator models (machine → Norton equivalent)
+            ordr  – reorders the network admittance matrix for dynamics
+            fact  – factorises the reordered matrix (LU decomposition)
+            tysl  – solves the initial-condition power flow for dynamics
+
+        If dyre_new() is called before these steps the CON array starts at
+        index 0, which is invalid, and PSS/E raises message 001544:
+            "Invalid starting CON index: 0; value must be in range 1–671000"
+
+        Parameters
+        ----------
+        psspy : module
+            The active psspy module from PSSEInterface.
+
+        Returns
+        -------
+        bool
+            True if all conversion steps succeeded, False on any error.
+        """
+        _i = psspy.getdefaultint()
+        _f = psspy.getdefaultreal()
+
+        # ── conl: three-pass load conversion ─────────────────────────────────
+        # Pass 1 (init), Pass 2 (convert), Pass 3 (finalise).
+        # [0,0] flag pair: use 100 % constant-power for both active and
+        # reactive load — standard starting point for TS studies.
+        for conl_step in (1, 2, 3):
+            ierr = psspy.conl(_i, 1, conl_step, [0, 0], [100.0, 0.0, 0.0, 100.0])
+            if ierr != 0:
+                logger.warning(
+                    "  conl step %d returned ierr=%d (non-fatal, continuing).",
+                    conl_step, ierr,
+                )
+
+        # ── cong: convert generator models ───────────────────────────────────
+        ierr = psspy.cong(0)
+        if ierr != 0:
+            logger.warning("  cong() returned ierr=%d.", ierr)
+
+        # ── ordr: order network for dynamics ─────────────────────────────────
+        ierr = psspy.ordr(0)
+        if ierr != 0:
+            logger.error("  ordr() failed (ierr=%d). Dynamics conversion aborted.", ierr)
+            return False
+
+        # ── fact: factorise network matrix ────────────────────────────────────
+        ierr = psspy.fact()
+        if ierr != 0:
+            logger.error("  fact() failed (ierr=%d). Dynamics conversion aborted.", ierr)
+            return False
+
+        # ── tysl: solve initial-condition power flow ──────────────────────────
+        ierr = psspy.tysl(0)
+        if ierr != 0:
+            logger.warning(
+                "  tysl() returned ierr=%d (may be acceptable if residuals are "
+                "small; check PSS/E output for convergence message).",
+                ierr,
+            )
+
+        logger.debug("  Network conversion for dynamics complete.")
+        return True
 
     def _load_dynamics(self, psspy, sav_path: str) -> bool:
         """
         Load the .dyr dynamic data file into PSS/E memory.
 
-        Must be called after every psspy.case() call because loading a new
-        .sav clears all previously loaded dynamic models from memory.
-        PSS/E API call: psspy.dyre_new() reads a .dyr file and registers
-        all machine, exciter, governor, and PSS models.
+        Must be called AFTER _convert_for_dynamics() on every fresh .sav
+        load because:
+          - psspy.case() loads power flow data only; it clears dynamic models.
+          - psspy.dyre_new() requires CON/STATE/VAR arrays to already exist
+            (allocated by the conversion sequence).
 
-        Resolution order for the .dyr path (via ProjectData.resolve_dyr_path):
-          1. info.dyr_file_path  — explicit path in Project_Info sheet / GUI
-          2. sav_path with .sav replaced by .dyr  — co-located file
+        Uses psspy.getdefaultint() for all iflags — passing literal 0 is
+        incorrect and can cause ierr=1 on some PSS/E versions.
+
+        Resolution order for the .dyr path:
+          1. ProjectData.resolve_dyr_path()  (explicit path in Project_Info)
+          2. sav_path with .sav replaced by .dyr  (co-located fallback)
 
         Parameters
         ----------
         psspy : module
             The active psspy module from PSSEInterface.
         sav_path : str
-            Path to the .sav file just loaded (used as a fallback base path).
+            Path to the .sav file just loaded (used as fallback base path).
 
         Returns
         -------
@@ -336,27 +431,29 @@ class TransientStabilityStudy:
         """
         dyr_path = self._project.resolve_dyr_path()
 
-        # If resolve_dyr_path() returned empty or the project-level path is
-        # empty, fall back to deriving from the per-contingency sav_path.
         if not dyr_path or not os.path.isfile(dyr_path):
             dyr_path = os.path.splitext(sav_path)[0] + ".dyr"
 
         if not os.path.isfile(dyr_path):
             logger.error(
-                "  .dyr file not found. Dynamics cannot be loaded. "
-                "Set 'DYR File Path' in Project_Info or place a .dyr file "
-                "alongside the .sav file. Checked: '%s'",
+                "  .dyr file not found. Set 'DYR File Path' in Project_Info "
+                "or place a .dyr alongside the .sav. Checked: '%s'",
                 dyr_path,
             )
             return False
 
-        # psspy.dyre_new([iflags], dyrfile, ldyfile, logfile, status)
-        # iflags=[0,0,0,0]: use defaults for all options
-        # Empty strings for ldyfile/logfile: no separate load/log files
-        ierr = psspy.dyre_new([0, 0, 0, 0], dyr_path, "", "", "")
+        # Use getdefaultint() for ALL iflags — never literal 0.
+        # Passing 0 instead of _i causes ierr=1 on PSS/E 34/35 because
+        # PSS/E interprets 0 as an explicit "no default" override and
+        # rejects the resulting invalid parameter combination.
+        _i = psspy.getdefaultint()
+        _s = psspy.getdefaultchar()
+
+        ierr = psspy.dyre_new([_i, _i, _i, _i], dyr_path, _s, _s, _s)
         if ierr != 0:
             logger.error(
-                "  psspy.dyre_new() failed (ierr=%d) for .dyr file: '%s'.",
+                "  psspy.dyre_new() failed (ierr=%d) for .dyr: '%s'. "
+                "Ensure _convert_for_dynamics() ran successfully first.",
                 ierr, dyr_path,
             )
             return False
@@ -371,8 +468,6 @@ class TransientStabilityStudy:
     ) -> ContingencyTSResult:
         """Run one contingency and return its result."""
 
-        # Fault clearing time comes from the Study Scope table (per contingency)
-        # Use near-end clearing time (more conservative)
         fault_clear_time_s = (
             self.fault_apply_time_s + cont.near_end_seconds
         )
@@ -392,28 +487,17 @@ class TransientStabilityStudy:
         if self._psse.mock:
             return self._mock_contingency_result(result)
 
-        psspy = self._psse.psspy
+        psspy   = self._psse.psspy
         poi_bus = self._project.info.poi_bus_number
 
-        # ── Step 1: Load fresh case ─────────────────────────────────────────
+        # ── Step 1: Load fresh power-flow case ───────────────────────────────
         ierr = psspy.case(sav_path)
         if ierr != 0:
             logger.error("  Failed to load case for '%s'.", cont.contingency_name)
             return result
 
-        # ── Step 2: Load dynamic models (.dyr) ──────────────────────────────
-        # MUST be done after psspy.case() and before psspy.strt().
-        # psspy.case() loads power flow data only; dynamic models are cleared
-        # from memory each time a new .sav is loaded. Without this step,
-        # psspy.strt() will fail with ierr=5 ("No dynamics data in memory").
-        if not self._load_dynamics(psspy, sav_path):
-            logger.error(
-                "  Skipping contingency '%s': dynamics could not be loaded.",
-                cont.contingency_name,
-            )
-            return result
-
-        # ── Step 3: Solve base power flow ───────────────────────────────────
+        # ── Step 2: Solve base Newton-Raphson power flow ──────────────────────
+        # Run FNSL before conversion so we start from a converged snapshot.
         ret = psspy.fnsl([1, 0, 1, 1, 1, 0, 0, 0])
         result.converged_base = (ret == 0)
         if not result.converged_base:
@@ -423,18 +507,33 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 4: Set up output channels ───────────────────────────────────
+        # ── Step 3: Convert network for dynamics (conl/cong/ordr/fact/tysl) ──
+        # This step MUST precede dyre_new().  It allocates PSS/E's internal
+        # CON array.  Without it, dyre_new() fails with:
+        #   "Invalid starting CON index: 0"  (message 001544, ierr=1)
+        if not self._convert_for_dynamics(psspy):
+            logger.error(
+                "  Network conversion failed for '%s'. Skipping.",
+                cont.contingency_name,
+            )
+            return result
+
+        # ── Step 4: Load dynamic models (.dyr) ───────────────────────────────
+        # Called after conversion (Step 3) and before strt() (Step 6).
+        if not self._load_dynamics(psspy, sav_path):
+            logger.error(
+                "  Skipping contingency '%s': dynamics could not be loaded.",
+                cont.contingency_name,
+            )
+            return result
+
+        # ── Step 5: Set up output channels ───────────────────────────────────
         # Channel setup must be done BEFORE psspy.strt().
-        # We set up channels for:
-        #   - POI bus voltage (if poi_bus is known)
-        #   - Generator rotor angles (relative to system COI reference)
-        #   - Active and reactive power at POI
         output_file = os.path.join(
             os.path.dirname(sav_path),
             f"ts_{self.scenario}_{_safe_filename(cont.contingency_name)}.out"
         )
 
-        # Initialise output file
         psspy.delete_all_plot_channels()
 
         # POI bus voltage channel
@@ -445,35 +544,30 @@ class TransientStabilityStudy:
                     "  Could not add voltage channel for POI bus %d.", poi_bus
                 )
 
-        # Add rotor angle channels for generators in study area.
-        # FIX: psspy.angle_channel() does not exist in the PSS/E Python API.
-        # The correct function is psspy.machine_array_channel():
-        #   - ITYPE=1 requests the rotor angle output (degrees relative to
-        #     the system centre-of-inertia reference)
-        #   - Parameters: [subsystem, ITYPE, bus_number], machine_id, label
+        # Rotor angle channels for all generators.
+        # psspy.machine_array_channel([subsystem, ITYPE, bus], id, label)
+        #   ITYPE=1  →  rotor angle (degrees, relative to COI reference)
         try:
-            ierr, (gen_buses,) = psspy.amachint(-1, 4, ["NUMBER"])
-            ierr2, (gen_ids,)  = psspy.amachchar(-1, 4, ["ID"])
+            ierr,  (gen_buses,) = psspy.amachint(-1, 4, ["NUMBER"])
+            ierr2, (gen_ids,)   = psspy.amachchar(-1, 4, ["ID"])
             for i, gbus in enumerate(gen_buses):
                 gid = gen_ids[i].strip() if gen_ids else "1"
                 ierr_ch = psspy.machine_array_channel(
-                    [-1, 1, gbus],          # subsystem=-1 (all), ITYPE=1 (angle), bus
-                    gid,                    # machine ID string
+                    [-1, 1, gbus],
+                    gid,
                     f"Rotor Angle Bus {gbus}",
                 )
                 if ierr_ch != 0:
                     logger.debug(
-                        "  Could not add rotor angle channel for gen at bus %d "
-                        "(machine_array_channel ierr=%d).",
-                        gbus, ierr_ch,
+                        "  machine_array_channel ierr=%d for gen at bus %d.",
+                        ierr_ch, gbus,
                     )
         except Exception as exc:
             logger.debug("  Generator channel setup: %s", exc)
 
-        # ── Step 5: Initialise dynamics ───────────────────────────────────────
-        # psspy.strt() initialises the dynamic simulation and writes the
-        # output file header. It requires dynamic models to already be in
-        # memory (loaded in Step 2 above). units=0 → output in per unit.
+        # ── Step 6: Initialise dynamics ───────────────────────────────────────
+        # psspy.strt() requires dynamic models in memory (Step 4).
+        # units=0 → output in per unit / degrees.
         ierr = psspy.strt(0, output_file)
         if ierr != 0:
             logger.warning(
@@ -482,41 +576,34 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 6: Run to fault application time ──────────────────────────
+        # ── Step 7: Run to fault application time ─────────────────────────────
         ierr = psspy.run(0, self.fault_apply_time_s, 1000, 1, 0)
         if ierr != 0:
-            logger.warning(
-                "  Pre-fault simulation failed (ierr=%d).", ierr
-            )
+            logger.warning("  Pre-fault simulation failed (ierr=%d).", ierr)
             return result
 
-        # ── Step 7: Apply 3-phase fault ───────────────────────────────────────
+        # ── Step 8: Apply bolted 3-phase fault ────────────────────────────────
         fault_bus = cont.from_bus_no
         if fault_bus is None:
             logger.warning(
-                "  No fault bus defined for '%s'. Cannot apply fault. "
+                "  No fault bus defined for '%s'. "
                 "Fill From Bus No in TS_Contingencies sheet.",
                 cont.contingency_name
             )
             return result
 
-        # Apply bolted 3-phase fault: fault impedance = 0
-        # fault_bus, units, voltage, basekv, 0.0+j0.0 fault impedance
         ierr = psspy.dist_bus_fault(fault_bus, 1, 0.0, [0.0, 0.0])
         if ierr != 0:
             logger.warning(
-                "  dist_bus_fault failed (ierr=%d) at bus %d.",
-                ierr, fault_bus
+                "  dist_bus_fault failed (ierr=%d) at bus %d.", ierr, fault_bus
             )
 
-        # ── Step 8: Run during-fault ────────────────────────────────────────
+        # ── Step 9: Run during-fault ──────────────────────────────────────────
         ierr = psspy.run(0, fault_clear_time_s, 1000, 1, 0)
 
-        # ── Step 9: Clear fault (open branch) ──────────────────────────────
-        # Remove fault
-        ierr_cf = psspy.dist_clear_fault(1)
+        # ── Step 10: Clear fault and trip branch ──────────────────────────────
+        psspy.dist_clear_fault(1)
 
-        # Trip the contingency branch (N-1)
         if cont.from_bus_no and cont.to_bus_no:
             psspy.dist_branch_trip(
                 cont.from_bus_no,
@@ -524,15 +611,14 @@ class TransientStabilityStudy:
                 cont.circuit_id,
             )
 
-        # ── Step 10: Run post-fault simulation ─────────────────────────────
+        # ── Step 11: Run post-fault simulation ────────────────────────────────
         ierr = psspy.run(0, self.sim_duration_s, 10000, 1, 0)
         result.sim_completed = (ierr == 0)
 
-        # ── Step 11: Extract channel data ───────────────────────────────────
-        channels = self._extract_channels(psspy, output_file, poi_bus)
-        result.channels = channels
+        # ── Step 12: Extract channel data ─────────────────────────────────────
+        result.channels = self._extract_channels(psspy, output_file, poi_bus)
 
-        # ── Step 12: Evaluate AESO criteria ────────────────────────────────
+        # ── Step 13: Evaluate AESO criteria ──────────────────────────────────
         self._evaluate_criteria(result, poi_bus)
 
         return result
@@ -549,18 +635,15 @@ class TransientStabilityStudy:
         """
         channels = {}
         try:
-            # Get number of channels written
             ierr, nchan = psspy.numchnf(output_file)
             if ierr != 0 or nchan == 0:
                 return channels
 
-            # Read time axis
-            ierr, time_arr = psspy.chnval(0)   # channel 0 = time
+            ierr, time_arr = psspy.chnval(0)
             if ierr != 0:
                 return channels
             time_list = list(time_arr) if time_arr else []
 
-            # Read each channel
             for ch in range(1, nchan + 1):
                 try:
                     ierr_ch, desc = psspy.chndes(ch)
@@ -593,8 +676,7 @@ class TransientStabilityStudy:
         fault_clear_time = result.fault_clear_time_s
         recovery_end     = fault_clear_time + self.v_recovery_window_s
 
-        # Check rotor angle stability
-        # Look for any channel with "Rotor Angle" or "ANGLE" in name
+        # Rotor angle stability
         max_angle = 0.0
         for name, ch in result.channels.items():
             if "angle" in name.lower() or "rotor" in name.lower():
@@ -607,10 +689,10 @@ class TransientStabilityStudy:
 
         result.max_rotor_angle_deg = round(max_angle, 2)
 
-        # Check POI voltage recovery
-        poi_key = f"Bus Voltage POI" if poi_bus else None
+        # POI voltage recovery
+        poi_key = "Bus Voltage POI" if poi_bus else None
         if poi_key and poi_key in result.channels:
-            ch = result.channels[poi_key]
+            ch    = result.channels[poi_key]
             min_v = 1.0
             recovered = False
             for t, v in zip(ch.time_s, ch.values):
@@ -625,8 +707,7 @@ class TransientStabilityStudy:
             result.min_poi_voltage_pu = round(min_v, 4)
             result.voltage_recovered  = recovered
         else:
-            # No POI channel — cannot assess, mark as warning
-            result.voltage_recovered  = True   # conservative: don't fail
+            result.voltage_recovered  = True
             result.min_poi_voltage_pu = 0.0
             logger.warning(
                 "  POI bus voltage channel not available for '%s'. "
@@ -634,7 +715,7 @@ class TransientStabilityStudy:
                 result.contingency_name
             )
 
-    # ── Private: plots ────────────────────────────────────────────────────────────
+    # ── Private: plots ────────────────────────────────────────────────────────
 
     def _plot_contingency(
         self,
@@ -642,43 +723,35 @@ class TransientStabilityStudy:
         plots_dir: str,
         label:     str,
     ) -> Optional[str]:
-        """
-        Multi-panel time-domain response plot for one contingency.
-        Panels: voltage, rotor angles, active power, reactive power.
-        """
+        """Multi-panel time-domain response plot for one contingency."""
         if not cont.channels:
             return None
 
-        # Separate channels by type
-        voltage_chs  = [ch for n, ch in cont.channels.items()
-                        if "voltage" in n.lower() or "volt" in n.lower()]
-        angle_chs    = [ch for n, ch in cont.channels.items()
-                        if "angle" in n.lower() or "rotor" in n.lower()]
-        pq_chs       = [ch for n, ch in cont.channels.items()
-                        if "power" in n.lower() or " p " in n.lower()
-                        or " q " in n.lower()]
+        voltage_chs = [ch for n, ch in cont.channels.items()
+                       if "voltage" in n.lower() or "volt" in n.lower()]
+        angle_chs   = [ch for n, ch in cont.channels.items()
+                       if "angle" in n.lower() or "rotor" in n.lower()]
+        pq_chs      = [ch for n, ch in cont.channels.items()
+                       if "power" in n.lower() or " p " in n.lower()
+                       or " q " in n.lower()]
 
         panels = []
-        if voltage_chs: panels.append(("Bus Voltage (pu)",    voltage_chs))
-        if angle_chs:   panels.append(("Rotor Angle (deg)",   angle_chs))
-        if pq_chs:      panels.append(("Power (MW / MVAR)",   pq_chs))
+        if voltage_chs: panels.append(("Bus Voltage (pu)",  voltage_chs))
+        if angle_chs:   panels.append(("Rotor Angle (deg)", angle_chs))
+        if pq_chs:      panels.append(("Power (MW / MVAR)", pq_chs))
 
         if not panels:
             return None
 
         n_panels = len(panels)
-        fig, axes = plt.subplots(
-            n_panels, 1,
-            figsize=(12, 3 * n_panels),
-            sharex=True,
-        )
+        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 3 * n_panels), sharex=True)
         if n_panels == 1:
             axes = [axes]
 
         colors = [_BLUE, _RED, _ORANGE, _GREEN, _GREY]
 
         for ax, (ylabel, chs) in zip(axes, panels):
-            for i, ch in enumerate(chs[:5]):   # max 5 channels per panel
+            for i, ch in enumerate(chs[:5]):
                 if ch.time_s and ch.values:
                     ax.plot(
                         ch.time_s, ch.values,
@@ -686,30 +759,19 @@ class TransientStabilityStudy:
                         linewidth=1.5,
                         label=ch.name[:40],
                     )
-            # Shade fault period
-            ax.axvspan(
-                cont.fault_apply_time_s,
-                cont.fault_clear_time_s,
-                alpha=0.15, color=_RED, label="Fault period"
-            )
-            # Recovery window
-            ax.axvspan(
-                cont.fault_clear_time_s,
-                cont.fault_clear_time_s + self.v_recovery_window_s,
-                alpha=0.08, color=_ORANGE, label="Recovery window"
-            )
+            ax.axvspan(cont.fault_apply_time_s, cont.fault_clear_time_s,
+                       alpha=0.15, color=_RED, label="Fault period")
+            ax.axvspan(cont.fault_clear_time_s,
+                       cont.fault_clear_time_s + self.v_recovery_window_s,
+                       alpha=0.08, color=_ORANGE, label="Recovery window")
             if "Voltage" in ylabel:
-                ax.axhline(
-                    self.v_recovery_pu,
-                    color=_RED, linestyle="--", linewidth=1.2,
-                    label=f"V recovery limit ({self.v_recovery_pu} pu)"
-                )
+                ax.axhline(self.v_recovery_pu, color=_RED, linestyle="--",
+                           linewidth=1.2,
+                           label=f"V recovery limit ({self.v_recovery_pu} pu)")
             if "Angle" in ylabel:
-                ax.axhline(
-                    self.rotor_limit,
-                    color=_RED, linestyle="--", linewidth=1.2,
-                    label=f"Angle limit ({self.rotor_limit}°)"
-                )
+                ax.axhline(self.rotor_limit, color=_RED, linestyle="--",
+                           linewidth=1.2,
+                           label=f"Angle limit ({self.rotor_limit}°)")
             ax.set_ylabel(ylabel, fontsize=9)
             ax.grid(True, zorder=0)
             ax.legend(fontsize=7, loc="upper right", ncol=2)
@@ -732,13 +794,12 @@ class TransientStabilityStudy:
         logger.info("Plot saved: %s", path)
         return path
 
-    # ── Private: PDF export ──────────────────────────────────────────────────────
+    # ── Private: PDF export ───────────────────────────────────────────────────
 
     def _export_pdf(self, pdf_path: str, plot_paths: List[str]) -> None:
         """Assemble PDF: plots + compliance summary table."""
         with PdfPages(pdf_path) as pdf:
 
-            # Embed each PNG
             for png in plot_paths:
                 if png and os.path.isfile(png):
                     img = plt.imread(png)
@@ -748,7 +809,6 @@ class TransientStabilityStudy:
                     pdf.savefig(fig, bbox_inches="tight")
                     plt.close(fig)
 
-            # Compliance summary table
             df = self._compliance_to_df()
             if not df.empty:
                 fig2, ax2 = plt.subplots(
@@ -774,8 +834,7 @@ class TransientStabilityStudy:
                         for col in range(len(df.columns)):
                             tbl[row, col].set_facecolor("#e0ffe0")
                 ax2.set_title(
-                    f"AESO Transient Stability — Compliance Summary\n"
-                    f"{self.scenario}",
+                    f"AESO Transient Stability — Compliance Summary\n{self.scenario}",
                     fontsize=11, weight="bold", pad=15,
                 )
                 plt.tight_layout()
@@ -787,22 +846,22 @@ class TransientStabilityStudy:
             d["Author"]       = "AESO Automation Tool"
             d["CreationDate"] = datetime.now()
 
-    # ── Private: DataFrame builders ───────────────────────────────────────────────
+    # ── Private: DataFrame builders ───────────────────────────────────────────
 
     def _summary_to_df(self) -> pd.DataFrame:
         r = self.results
         if r is None:
             return pd.DataFrame()
         return pd.DataFrame([
-            {"Parameter": "Scenario",                  "Value": r.scenario_label},
-            {"Parameter": "SAV File",                  "Value": os.path.basename(r.sav_path)},
-            {"Parameter": "Simulation Duration (s)",   "Value": r.sim_duration_s},
-            {"Parameter": "Contingencies Run",         "Value": len(r.contingencies)},
-            {"Parameter": "AESO PASS",                 "Value": r.total_pass},
-            {"Parameter": "AESO FAIL",                 "Value": r.total_fail},
-            {"Parameter": "Rotor Angle Limit (deg)",   "Value": self.rotor_limit},
+            {"Parameter": "Scenario",                   "Value": r.scenario_label},
+            {"Parameter": "SAV File",                   "Value": os.path.basename(r.sav_path)},
+            {"Parameter": "Simulation Duration (s)",    "Value": r.sim_duration_s},
+            {"Parameter": "Contingencies Run",          "Value": len(r.contingencies)},
+            {"Parameter": "AESO PASS",                  "Value": r.total_pass},
+            {"Parameter": "AESO FAIL",                  "Value": r.total_fail},
+            {"Parameter": "Rotor Angle Limit (deg)",    "Value": self.rotor_limit},
             {"Parameter": "Voltage Recovery Limit (pu)","Value": self.v_recovery_pu},
-            {"Parameter": "Recovery Window (s)",       "Value": self.v_recovery_window_s},
+            {"Parameter": "Recovery Window (s)",        "Value": self.v_recovery_window_s},
         ])
 
     def _compliance_to_df(self) -> pd.DataFrame:
@@ -829,16 +888,13 @@ class TransientStabilityStudy:
         """Convert channel data to a wide DataFrame (one column per channel)."""
         if not cont.channels:
             return pd.DataFrame()
-
-        # Use time from first channel
         first_ch = next(iter(cont.channels.values()))
         data: Dict[str, list] = {"Time (s)": first_ch.time_s}
         for name, ch in cont.channels.items():
             data[name] = ch.values
-
         return pd.DataFrame(data)
 
-    # ── Mock data ───────────────────────────────────────────────────────────────────
+    # ── Mock data ─────────────────────────────────────────────────────────────
 
     def _mock_contingency_result(
         self,
@@ -856,22 +912,19 @@ class TransientStabilityStudy:
         fa = result.fault_apply_time_s
         fc = result.fault_clear_time_s
 
-        # Synthetic voltage — dips during fault, recovers after
         voltages = []
         for t in times:
             if t < fa:
                 v = 1.00 + random.uniform(-0.005, 0.005)
             elif t < fc:
-                v = 0.05 + random.uniform(-0.02, 0.02)  # fault
+                v = 0.05 + random.uniform(-0.02, 0.02)
             else:
-                # Recovery curve
-                tau = 0.3
+                tau  = 0.3
                 v_ss = 0.97
                 v = v_ss - (v_ss - 0.05) * math.exp(-(t - fc) / tau)
                 v = min(v, 1.02) + random.uniform(-0.003, 0.003)
             voltages.append(round(v, 5))
 
-        # Synthetic rotor angle
         angles = []
         for t in times:
             if t < fa:
@@ -879,9 +932,9 @@ class TransientStabilityStudy:
             elif t < fc:
                 ang = 15.0 + 80.0 * (t - fa) / (fc - fa)
             else:
-                peak = 15.0 + 80.0
+                peak  = 15.0 + 80.0
                 decay = peak * math.exp(-0.8 * (t - fc))
-                ang = max(15.0, decay) + random.uniform(-2, 2)
+                ang   = max(15.0, decay) + random.uniform(-2, 2)
             angles.append(round(ang, 3))
 
         result.channels = {
@@ -895,13 +948,14 @@ class TransientStabilityStudy:
             ),
         }
 
-        result.converged_base     = True
-        result.sim_completed      = True
-        result.min_poi_voltage_pu = round(min(voltages[int(fa/t_step):int((fc+1)/t_step)]), 4)
-        result.voltage_recovered  = voltages[-1] >= self.v_recovery_pu
-        result.max_rotor_angle_deg= round(max(abs(a) for a in angles), 2)
-        result.rotor_angle_stable = result.max_rotor_angle_deg < self.rotor_limit
-        result.recovery_time_s    = round(
+        result.converged_base      = True
+        result.sim_completed       = True
+        result.min_poi_voltage_pu  = round(
+            min(voltages[int(fa/t_step):int((fc+1)/t_step)]), 4)
+        result.voltage_recovered   = voltages[-1] >= self.v_recovery_pu
+        result.max_rotor_angle_deg = round(max(abs(a) for a in angles), 2)
+        result.rotor_angle_stable  = result.max_rotor_angle_deg < self.rotor_limit
+        result.recovery_time_s     = round(
             max(0.0, next(
                 (t - fc for t, v in zip(times, voltages)
                  if t > fc and v >= self.v_recovery_pu),
