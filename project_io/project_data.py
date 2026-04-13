@@ -46,6 +46,10 @@ class ProjectInfo:
     poc_substation_name:  str   = ""
     study_area_regions:   str   = ""      # comma-separated planning area numbers
     sav_file_path:        str   = ""      # absolute path to .sav file
+    # Path to the PSS/E dynamic data file (.dyr).
+    # Required for Transient Stability studies.
+    # If empty, the study will attempt to derive it by replacing .sav with .dyr.
+    dyr_file_path:        str   = ""      # absolute path to .dyr file
     source_bus_number:    Optional[int]   = None   # solar plant generator bus
     poi_bus_number:       Optional[int]   = None   # point of interconnection bus
     ts_fault_bus_number:  Optional[int]   = None   # bus for TS fault application
@@ -329,6 +333,28 @@ class ProjectData:
             labels.update(r.dispatch_mw.keys())
         return sorted(labels)
 
+    def resolve_dyr_path(self) -> str:
+        """
+        Return the .dyr file path to use for Transient Stability studies.
+
+        Resolution order:
+          1. info.dyr_file_path  — explicit path set in Project_Info sheet or GUI
+          2. info.sav_file_path  — replace .sav extension with .dyr (co-located file)
+          3. Empty string        — no .dyr found; caller must handle the error
+
+        This method never raises; the caller checks whether the returned path
+        points to an existing file.
+        """
+        if self.info.dyr_file_path and os.path.isfile(self.info.dyr_file_path):
+            return self.info.dyr_file_path
+
+        if self.info.sav_file_path:
+            candidate = os.path.splitext(self.info.sav_file_path)[0] + ".dyr"
+            if os.path.isfile(candidate):
+                return candidate
+
+        return self.info.dyr_file_path  # may be empty — caller handles it
+
     # ─────────────────────────────────────────────────────────────────────────
     # Validation
     # ─────────────────────────────────────────────────────────────────────────
@@ -388,6 +414,16 @@ class ProjectData:
                 )
 
         if needs_ts:
+            # Validate that a .dyr file is available for TS studies
+            dyr_resolved = self.resolve_dyr_path()
+            if not dyr_resolved or not os.path.isfile(dyr_resolved):
+                warnings.append(
+                    "[CRITICAL] Transient Stability requires a .dyr dynamic data "
+                    "file. Set 'DYR File Path' in the Project_Info sheet, or place "
+                    "a .dyr file alongside the .sav file with the same base name. "
+                    f"Checked: '{self.info.dyr_file_path}' and "
+                    f"'{os.path.splitext(self.info.sav_file_path)[0] + '.dyr' if self.info.sav_file_path else 'N/A'}'"
+                )
             if self.info.ts_fault_bus_number is None:
                 warnings.append(
                     "[WARNING] Transient Stability: TS Fault Bus Number is not set. "
