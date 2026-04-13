@@ -1,0 +1,72 @@
+{
+  "_instructions": [
+    "This file stores manually verified PSS/E outputs used as golden reference values.",
+    "HOW TO POPULATE:",
+    "  Option A (recommended): run  python tests/extract_golden.py  — it fills this file automatically.",
+    "  Option B (manual): open each study in PSS/E, run it once, record the values below.",
+    "After populating, verify the values match your manual PSS/E output before committing.",
+    "Tolerances used in test_psse_live.py:",
+    "  voltage: ±0.005 pu  |  fault current: ±0.05 kA  |  rotor angle: ±2 deg",
+    "  PV collapse: ±5 MW  |  energy balance mismatch: <0.5 %"
+  ],
+
+  "power_flow": {
+    "_comment": "Record POI and source bus voltages from a manual power flow solve on the .sav",
+    "poi_bus_number":    null,
+    "poi_voltage_pu":    null,
+    "source_bus_number": null,
+    "source_voltage_pu": null,
+    "key_buses": [
+      {
+        "_comment": "Add one entry per important bus (POI neighbours, source, slack, etc.)",
+        "bus_number":  null,
+        "bus_name":    "",
+        "voltage_pu":  null
+      }
+    ]
+  },
+
+  "short_circuit": {
+    "_comment": "Record 3PH and LG fault currents (kA) from a manual SC run at each substation bus",
+    "violation_count": 0,
+    "max_fault_bus_number": null,
+    "buses": [
+      {
+        "_comment": "Repeat this block for each substation / study bus",
+        "bus_number": null,
+        "bus_name":   "",
+        "base_kv":    null,
+        "3ph_ka":     null,
+        "lg_ka":      null
+      }
+    ]
+  },
+
+  "transient_stability": {
+    "_comment": "Record AESO pass/fail, peak rotor angle, and min POI voltage for each contingency",
+    "contingencies": [
+      {
+        "_comment": "Repeat for every contingency in your TS_Contingencies sheet",
+        "contingency_name":    "",
+        "aeso_pass":           null,
+        "max_rotor_angle_deg": null,
+        "min_poi_voltage_pu":  null,
+        "recovery_time_s":     null
+      }
+    ]
+  },
+
+  "pv_stability": {
+    "_comment": "Record PV curve collapse points and minimum voltages from a manual PV run",
+    "marp_mw":        null,
+    "n0_collapse_mw": null,
+    "n1_contingencies": [
+      {
+        "_comment": "Repeat for each N-1 contingency in your PV_Contingencies sheet",
+        "contingency_element": "",
+        "collapse_mw":         null,
+        "min_voltage_pu":      null
+      }
+    ]
+  }
+}
