@@ -27,18 +27,34 @@ Workflow
     l. Check AESO criteria: rotor angle stability, voltage recovery
 7.  Export results to Excel + multi-panel PNG plots + PDF report
 
+PSS/E Python 3.7 binding return-value note
+------------------------------------------
+Many psspy functions return a TUPLE on the PSS/E Py3.7 binding, not a plain
+int.  For example:
+    psspy.conl(...)  ->  (ierr,)   NOT  ierr
+    psspy.cong(...)  ->  (ierr,)
+    psspy.ordr(...)  ->  (ierr,)
+    psspy.fact(...)  ->  (ierr,)
+    psspy.tysl(...)  ->  (ierr,)
+    psspy.fnsl(...)  ->  (ierr,)
+    psspy.strt(...)  ->  (ierr,)   (some builds)
+    psspy.case(...)  ->  int  (usually plain int on older builds)
+
+The helper _ierr() below handles both cases transparently so that log
+format strings with %d never receive a tuple.
+
 Root cause of "Invalid starting CON index: 0"  (PSS/E message 001544)
 ----------------------------------------------------------------------
 PSS/E's dynamic simulation requires internal arrays (CON, STATE, VAR) to be
 allocated before any dynamic data can be read.  These arrays are allocated by
 the network-conversion activities:
     conl  – converts load models
-    cong  – converts generator models
+    cong  – converts generator models (machine → Norton equivalent)
     ordr  – orders the network for dynamics
     fact  – factorises the network matrix
     tysl  – solves the initial-conditions power flow
 
-Calling psspy.dyre_new() before these four steps leaves the CON array at its
+Calling psspy.dyre_new() before these steps leaves the CON array at its
 default starting index of 0, which PSS/E rejects.  The fix is to run the full
 conversion sequence every time a fresh .sav is loaded — before dyre_new().
 
@@ -108,6 +124,31 @@ plt.rcParams.update({
     "grid.linewidth":   1.0,
     "font.family":      "DejaVu Sans",
 })
+
+
+# ── PSS/E return-value helper ─────────────────────────────────────────────────
+
+def _ierr(ret) -> int:
+    """
+    Normalise a psspy return value to a plain int.
+
+    PSS/E's Python 3.7 binding wraps many return codes in a 1-tuple:
+        psspy.conl(...)  ->  (0,)   instead of  0
+        psspy.cong(...)  ->  (0,)
+        psspy.ordr(...)  ->  (0,)
+        psspy.fact(...)  ->  (0,)
+        psspy.tysl(...)  ->  (0,)
+        psspy.fnsl(...)  ->  (0,)
+
+    Passing a tuple to a '%d' format string raises:
+        TypeError: %d format: a number is required, not tuple
+
+    This helper unwraps the tuple when present so callers can always
+    use the result with '%d' in log messages.
+    """
+    if isinstance(ret, tuple):
+        return int(ret[0])
+    return int(ret)
 
 
 # ── Data containers ───────────────────────────────────────────────────────────
@@ -334,37 +375,30 @@ class TransientStabilityStudy:
         Run the PSS/E network-conversion sequence required before dyre_new().
 
         PSS/E allocates its internal CON, STATE, and VAR arrays only after the
-        following four activities have been executed in order:
+        following activities have been executed in order:
 
-            conl  – step 1/3 of load model conversion (constant-power portion)
-            cong  – converts generator models (machine → Norton equivalent)
+            conl  – 3-pass load model conversion (constant-power portion)
+            cong  – converts generator Norton equivalents
             ordr  – reorders the network admittance matrix for dynamics
-            fact  – factorises the reordered matrix (LU decomposition)
+            fact  – LU factorisation of the reordered matrix
             tysl  – solves the initial-condition power flow for dynamics
 
-        If dyre_new() is called before these steps the CON array starts at
-        index 0, which is invalid, and PSS/E raises message 001544:
-            "Invalid starting CON index: 0; value must be in range 1–671000"
-
-        Parameters
-        ----------
-        psspy : module
-            The active psspy module from PSSEInterface.
+        NOTE: All psspy calls here return a tuple (ierr,) on the PSS/E Python
+        3.7 binding.  The _ierr() helper unwraps this so that %d log format
+        strings never receive a tuple (which would raise TypeError).
 
         Returns
         -------
         bool
-            True if all conversion steps succeeded, False on any error.
+            True if all critical conversion steps succeeded, False on error.
         """
         _i = psspy.getdefaultint()
         _f = psspy.getdefaultreal()
 
         # ── conl: three-pass load conversion ─────────────────────────────────
-        # Pass 1 (init), Pass 2 (convert), Pass 3 (finalise).
-        # [0,0] flag pair: use 100 % constant-power for both active and
-        # reactive load — standard starting point for TS studies.
         for conl_step in (1, 2, 3):
-            ierr = psspy.conl(_i, 1, conl_step, [0, 0], [100.0, 0.0, 0.0, 100.0])
+            ret  = psspy.conl(_i, 1, conl_step, [0, 0], [100.0, 0.0, 0.0, 100.0])
+            ierr = _ierr(ret)
             if ierr != 0:
                 logger.warning(
                     "  conl step %d returned ierr=%d (non-fatal, continuing).",
@@ -372,24 +406,28 @@ class TransientStabilityStudy:
                 )
 
         # ── cong: convert generator models ───────────────────────────────────
-        ierr = psspy.cong(0)
+        ret  = psspy.cong(0)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.warning("  cong() returned ierr=%d.", ierr)
 
         # ── ordr: order network for dynamics ─────────────────────────────────
-        ierr = psspy.ordr(0)
+        ret  = psspy.ordr(0)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.error("  ordr() failed (ierr=%d). Dynamics conversion aborted.", ierr)
             return False
 
         # ── fact: factorise network matrix ────────────────────────────────────
-        ierr = psspy.fact()
+        ret  = psspy.fact()
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.error("  fact() failed (ierr=%d). Dynamics conversion aborted.", ierr)
             return False
 
         # ── tysl: solve initial-condition power flow ──────────────────────────
-        ierr = psspy.tysl(0)
+        ret  = psspy.tysl(0)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.warning(
                 "  tysl() returned ierr=%d (may be acceptable if residuals are "
@@ -417,13 +455,6 @@ class TransientStabilityStudy:
           1. ProjectData.resolve_dyr_path()  (explicit path in Project_Info)
           2. sav_path with .sav replaced by .dyr  (co-located fallback)
 
-        Parameters
-        ----------
-        psspy : module
-            The active psspy module from PSSEInterface.
-        sav_path : str
-            Path to the .sav file just loaded (used as fallback base path).
-
         Returns
         -------
         bool
@@ -442,14 +473,11 @@ class TransientStabilityStudy:
             )
             return False
 
-        # Use getdefaultint() for ALL iflags — never literal 0.
-        # Passing 0 instead of _i causes ierr=1 on PSS/E 34/35 because
-        # PSS/E interprets 0 as an explicit "no default" override and
-        # rejects the resulting invalid parameter combination.
         _i = psspy.getdefaultint()
         _s = psspy.getdefaultchar()
 
-        ierr = psspy.dyre_new([_i, _i, _i, _i], dyr_path, _s, _s, _s)
+        ret  = psspy.dyre_new([_i, _i, _i, _i], dyr_path, _s, _s, _s)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.error(
                 "  psspy.dyre_new() failed (ierr=%d) for .dyr: '%s'. "
@@ -491,26 +519,24 @@ class TransientStabilityStudy:
         poi_bus = self._project.info.poi_bus_number
 
         # ── Step 1: Load fresh power-flow case ───────────────────────────────
-        ierr = psspy.case(sav_path)
+        ret  = psspy.case(sav_path)
+        ierr = _ierr(ret)
         if ierr != 0:
-            logger.error("  Failed to load case for '%s'.", cont.contingency_name)
+            logger.error("  Failed to load case (ierr=%d) for '%s'.", ierr, cont.contingency_name)
             return result
 
         # ── Step 2: Solve base Newton-Raphson power flow ──────────────────────
-        # Run FNSL before conversion so we start from a converged snapshot.
-        ret = psspy.fnsl([1, 0, 1, 1, 1, 0, 0, 0])
-        result.converged_base = (ret == 0)
+        ret  = psspy.fnsl([1, 0, 1, 1, 1, 0, 0, 0])
+        ierr = _ierr(ret)
+        result.converged_base = (ierr == 0)
         if not result.converged_base:
             logger.warning(
-                "  Base case did not converge for '%s'. Skipping.",
-                cont.contingency_name
+                "  Base case did not converge (ierr=%d) for '%s'. Skipping.",
+                ierr, cont.contingency_name
             )
             return result
 
         # ── Step 3: Convert network for dynamics (conl/cong/ordr/fact/tysl) ──
-        # This step MUST precede dyre_new().  It allocates PSS/E's internal
-        # CON array.  Without it, dyre_new() fails with:
-        #   "Invalid starting CON index: 0"  (message 001544, ierr=1)
         if not self._convert_for_dynamics(psspy):
             logger.error(
                 "  Network conversion failed for '%s'. Skipping.",
@@ -519,7 +545,6 @@ class TransientStabilityStudy:
             return result
 
         # ── Step 4: Load dynamic models (.dyr) ───────────────────────────────
-        # Called after conversion (Step 3) and before strt() (Step 6).
         if not self._load_dynamics(psspy, sav_path):
             logger.error(
                 "  Skipping contingency '%s': dynamics could not be loaded.",
@@ -528,7 +553,6 @@ class TransientStabilityStudy:
             return result
 
         # ── Step 5: Set up output channels ───────────────────────────────────
-        # Channel setup must be done BEFORE psspy.strt().
         output_file = os.path.join(
             os.path.dirname(sav_path),
             f"ts_{self.scenario}_{_safe_filename(cont.contingency_name)}.out"
@@ -538,10 +562,12 @@ class TransientStabilityStudy:
 
         # POI bus voltage channel
         if poi_bus:
-            ierr = psspy.voltage_channel([-1, -1, -1, poi_bus], "Bus Voltage POI")
+            ret  = psspy.voltage_channel([-1, -1, -1, poi_bus], "Bus Voltage POI")
+            ierr = _ierr(ret)
             if ierr != 0:
                 logger.warning(
-                    "  Could not add voltage channel for POI bus %d.", poi_bus
+                    "  Could not add voltage channel for POI bus %d (ierr=%d).",
+                    poi_bus, ierr,
                 )
 
         # Rotor angle channels for all generators.
@@ -552,11 +578,12 @@ class TransientStabilityStudy:
             ierr2, (gen_ids,)   = psspy.amachchar(-1, 4, ["ID"])
             for i, gbus in enumerate(gen_buses):
                 gid = gen_ids[i].strip() if gen_ids else "1"
-                ierr_ch = psspy.machine_array_channel(
+                ret_ch  = psspy.machine_array_channel(
                     [-1, 1, gbus],
                     gid,
                     f"Rotor Angle Bus {gbus}",
                 )
+                ierr_ch = _ierr(ret_ch)
                 if ierr_ch != 0:
                     logger.debug(
                         "  machine_array_channel ierr=%d for gen at bus %d.",
@@ -566,9 +593,8 @@ class TransientStabilityStudy:
             logger.debug("  Generator channel setup: %s", exc)
 
         # ── Step 6: Initialise dynamics ───────────────────────────────────────
-        # psspy.strt() requires dynamic models in memory (Step 4).
-        # units=0 → output in per unit / degrees.
-        ierr = psspy.strt(0, output_file)
+        ret  = psspy.strt(0, output_file)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.warning(
                 "  psspy.strt() failed (ierr=%d) for '%s'.",
@@ -577,7 +603,8 @@ class TransientStabilityStudy:
             return result
 
         # ── Step 7: Run to fault application time ─────────────────────────────
-        ierr = psspy.run(0, self.fault_apply_time_s, 1000, 1, 0)
+        ret  = psspy.run(0, self.fault_apply_time_s, 1000, 1, 0)
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.warning("  Pre-fault simulation failed (ierr=%d).", ierr)
             return result
@@ -592,14 +619,15 @@ class TransientStabilityStudy:
             )
             return result
 
-        ierr = psspy.dist_bus_fault(fault_bus, 1, 0.0, [0.0, 0.0])
+        ret  = psspy.dist_bus_fault(fault_bus, 1, 0.0, [0.0, 0.0])
+        ierr = _ierr(ret)
         if ierr != 0:
             logger.warning(
                 "  dist_bus_fault failed (ierr=%d) at bus %d.", ierr, fault_bus
             )
 
         # ── Step 9: Run during-fault ──────────────────────────────────────────
-        ierr = psspy.run(0, fault_clear_time_s, 1000, 1, 0)
+        psspy.run(0, fault_clear_time_s, 1000, 1, 0)
 
         # ── Step 10: Clear fault and trip branch ──────────────────────────────
         psspy.dist_clear_fault(1)
@@ -612,7 +640,8 @@ class TransientStabilityStudy:
             )
 
         # ── Step 11: Run post-fault simulation ────────────────────────────────
-        ierr = psspy.run(0, self.sim_duration_s, 10000, 1, 0)
+        ret  = psspy.run(0, self.sim_duration_s, 10000, 1, 0)
+        ierr = _ierr(ret)
         result.sim_completed = (ierr == 0)
 
         # ── Step 12: Extract channel data ─────────────────────────────────────
@@ -635,19 +664,26 @@ class TransientStabilityStudy:
         """
         channels = {}
         try:
-            ierr, nchan = psspy.numchnf(output_file)
+            ret   = psspy.numchnf(output_file)
+            ierr  = _ierr(ret[0]) if isinstance(ret, tuple) else _ierr(ret)
+            nchan = ret[1] if isinstance(ret, tuple) else 0
             if ierr != 0 or nchan == 0:
                 return channels
 
-            ierr, time_arr = psspy.chnval(0)
-            if ierr != 0:
+            ret2      = psspy.chnval(0)
+            ierr2     = _ierr(ret2[0]) if isinstance(ret2, tuple) else _ierr(ret2)
+            time_arr  = ret2[1] if isinstance(ret2, tuple) else None
+            if ierr2 != 0:
                 return channels
             time_list = list(time_arr) if time_arr else []
 
             for ch in range(1, nchan + 1):
                 try:
-                    ierr_ch, desc = psspy.chndes(ch)
-                    ierr_v,  vals = psspy.chnval(ch)
+                    ret_d  = psspy.chndes(ch)
+                    ret_v  = psspy.chnval(ch)
+                    desc   = ret_d[1] if isinstance(ret_d, tuple) else ""
+                    vals   = ret_v[1] if isinstance(ret_v, tuple) else None
+                    ierr_v = _ierr(ret_v[0] if isinstance(ret_v, tuple) else ret_v)
                     if ierr_v == 0 and vals is not None:
                         cd = ChannelData(
                             name   = desc.strip() if desc else f"Channel {ch}",
