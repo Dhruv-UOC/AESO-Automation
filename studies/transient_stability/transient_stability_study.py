@@ -1,3 +1,4 @@
+
 """
 studies/transient_stability/transient_stability_study.py
 ---------------------------------------------------------
@@ -10,20 +11,20 @@ Workflow
     This allocates PSS/E's internal CON/STATE/VAR arrays.  DYRE_NEW will
     fail with "Invalid starting CON index: 0" if this step is skipped.
 3.  Load dynamic models (.dyr) via psspy.dyre_new()
-4.  Set up output channels (voltage, rotor angle, active/reactive power)
-5.  Initialise dynamic simulation (psspy.strt)
+4.  Set up output channels (voltage, rotor angle) — MUST be before strt()
+5.  Initialise dynamic simulation via psspy.strt()
 6.  For each contingency in TS_Contingencies:
     a. Reload fresh .sav
-    b. Re-run conversion sequence  (Steps 2 above)
-    c. Reload .dyr  (Step 3 above)
-    d. Set up output channels
-    e. Initialise dynamic simulation (psspy.strt)
-    f. Run pre-fault simulation to steady state (t=0 to fault_apply_time)
+    b. Re-run conversion sequence  (Step 2)
+    c. Reload .dyr                 (Step 3)
+    d. Set up output channels      (Step 4)  ← before strt()
+    e. Initialise dynamic sim      (Step 5)  ← strt() after channels
+    f. Run pre-fault  (t=0 → fault_apply_time)
     g. Apply bolted 3-phase fault at contingency bus
-    h. Run during-fault simulation (fault_apply_time to fault_clear_time)
-    i. Clear fault (restore branch)
-    j. Run post-fault simulation (fault_clear_time to sim_end)
-    k. Extract channel data: bus voltages, rotor angles, active/reactive power
+    h. Run during-fault (fault_apply_time → fault_clear_time)
+    i. Clear fault / trip branch
+    j. Run post-fault  (fault_clear_time → sim_end)
+    k. Extract channel data: bus voltages, rotor angles
     l. Check AESO criteria: rotor angle stability, voltage recovery
 7.  Export results to Excel + multi-panel PNG plots + PDF report
 
@@ -38,10 +39,33 @@ int.  For example:
     psspy.tysl(...)  ->  (ierr,)
     psspy.fnsl(...)  ->  (ierr,)
     psspy.strt(...)  ->  (ierr,)   (some builds)
-    psspy.case(...)  ->  int  (usually plain int on older builds)
+    psspy.case(...)  ->  int       (usually plain int on older builds)
 
 The helper _ierr() below handles both cases transparently so that log
 format strings with %d never receive a tuple.
+
+PSS/E STRT / RUN sequencing rules
+----------------------------------
+PSS/E enforces a strict activity order:
+    channels must be defined  →  strt()  →  run()
+
+Violating this order raises message 003538:
+    "Activity RUN is invalid — activity STRT needs to be executed"
+
+Two common causes:
+  1. strt() was never called (e.g. it failed silently and the code
+     continued to run() anyway).
+  2. strt() was called with an invalid or empty output-file path, causing
+     it to return a non-zero ierr which the caller ignored.
+
+Fixes applied:
+  • Output .out path is always an absolute path derived from the directory
+    that contains the .sav file.  If that directory is empty (bare filename)
+    we fall back to a guaranteed-writable temp directory.
+  • strt() failure is treated as FATAL — we return early and never call
+    run() without a valid simulation session.
+  • Channel setup (voltage_channel, machine_array_channel) is done BEFORE
+    strt(), as required by PSS/E.
 
 Root cause of "Invalid starting CON index: 0"  (PSS/E message 001544)
 ----------------------------------------------------------------------
@@ -89,6 +113,7 @@ Usage
 
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -149,6 +174,36 @@ def _ierr(ret) -> int:
     if isinstance(ret, tuple):
         return int(ret[0])
     return int(ret)
+
+
+def _out_path(sav_path: str, scenario: str, cont_name: str) -> str:
+    """
+    Build a safe, absolute path for the PSS/E .out output file.
+
+    psspy.strt() fails with a non-zero ierr (and silently writes nothing)
+    when given an empty string, a relative path that resolves outside the
+    working directory, or a path whose parent directory does not exist.
+
+    Strategy:
+      1. Use the directory that contains the .sav file (most common case).
+      2. Fall back to the system temp directory if the .sav directory is
+         empty (bare filename) or does not exist / is not writable.
+    """
+    sav_dir = os.path.dirname(os.path.abspath(sav_path))
+    if not sav_dir or not os.path.isdir(sav_dir):
+        sav_dir = tempfile.gettempdir()
+
+    safe_cont = (
+        cont_name
+        .replace(" ", "_")
+        .replace(":", "-")
+        .replace("/", "-")
+        .replace("\\", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )[:60]
+
+    return os.path.join(sav_dir, f"ts_{scenario}_{safe_cont}.out")
 
 
 # ── Data containers ───────────────────────────────────────────────────────────
@@ -393,7 +448,6 @@ class TransientStabilityStudy:
             True if all critical conversion steps succeeded, False on error.
         """
         _i = psspy.getdefaultint()
-        _f = psspy.getdefaultreal()
 
         # ── conl: three-pass load conversion ─────────────────────────────────
         for conl_step in (1, 2, 3):
@@ -489,12 +543,68 @@ class TransientStabilityStudy:
         logger.debug("  Dynamics loaded from: %s", dyr_path)
         return True
 
+    def _setup_channels(self, psspy, sav_path: str, poi_bus: Optional[int]) -> str:
+        """
+        Define PSS/E output channels and return the absolute .out file path.
+
+        MUST be called AFTER dyre_new() and BEFORE strt().
+        PSS/E requires all channels to be registered before strt() is called;
+        channels added after strt() are ignored and may cause message 003538
+        ("Activity RUN is invalid — activity STRT needs to be executed") on
+        subsequent contingencies.
+
+        Returns
+        -------
+        str
+            Absolute path to the .out output file that will be written by strt().
+        """
+        output_file = _out_path(sav_path, self.scenario,
+                                getattr(self, "_current_cont_name", "contingency"))
+
+        psspy.delete_all_plot_channels()
+
+        # POI bus voltage channel
+        if poi_bus:
+            ret  = psspy.voltage_channel([-1, -1, -1, poi_bus], "Bus Voltage POI")
+            ierr = _ierr(ret)
+            if ierr != 0:
+                logger.warning(
+                    "  Could not add voltage channel for POI bus %d (ierr=%d).",
+                    poi_bus, ierr,
+                )
+
+        # Rotor angle channels for all in-service generators.
+        # psspy.machine_array_channel([subsystem, ITYPE, bus], id, label)
+        #   ITYPE=1  →  rotor angle (degrees, relative to COI reference)
+        try:
+            _r1, (gen_buses,) = psspy.amachint(-1, 4, ["NUMBER"])
+            _r2, (gen_ids,)   = psspy.amachchar(-1, 4, ["ID"])
+            for i, gbus in enumerate(gen_buses):
+                gid     = gen_ids[i].strip() if gen_ids else "1"
+                ret_ch  = psspy.machine_array_channel(
+                    [-1, 1, gbus],
+                    gid,
+                    f"Rotor Angle Bus {gbus}",
+                )
+                ierr_ch = _ierr(ret_ch)
+                if ierr_ch != 0:
+                    logger.debug(
+                        "  machine_array_channel ierr=%d for gen at bus %d.",
+                        ierr_ch, gbus,
+                    )
+        except Exception as exc:
+            logger.debug("  Generator channel setup: %s", exc)
+
+        return output_file
+
     def _run_contingency(
         self,
         sav_path: str,
         cont:     TSContingency,
     ) -> ContingencyTSResult:
         """Run one contingency and return its result."""
+
+        self._current_cont_name = cont.contingency_name   # used by _setup_channels
 
         fault_clear_time_s = (
             self.fault_apply_time_s + cont.near_end_seconds
@@ -522,7 +632,10 @@ class TransientStabilityStudy:
         ret  = psspy.case(sav_path)
         ierr = _ierr(ret)
         if ierr != 0:
-            logger.error("  Failed to load case (ierr=%d) for '%s'.", ierr, cont.contingency_name)
+            logger.error(
+                "  Failed to load case (ierr=%d) for '%s'.",
+                ierr, cont.contingency_name,
+            )
             return result
 
         # ── Step 2: Solve base Newton-Raphson power flow ──────────────────────
@@ -532,11 +645,12 @@ class TransientStabilityStudy:
         if not result.converged_base:
             logger.warning(
                 "  Base case did not converge (ierr=%d) for '%s'. Skipping.",
-                ierr, cont.contingency_name
+                ierr, cont.contingency_name,
             )
             return result
 
         # ── Step 3: Convert network for dynamics (conl/cong/ordr/fact/tysl) ──
+        # Allocates PSS/E's CON/STATE/VAR arrays.  Must precede dyre_new().
         if not self._convert_for_dynamics(psspy):
             logger.error(
                 "  Network conversion failed for '%s'. Skipping.",
@@ -545,6 +659,7 @@ class TransientStabilityStudy:
             return result
 
         # ── Step 4: Load dynamic models (.dyr) ───────────────────────────────
+        # Must follow _convert_for_dynamics() and precede strt().
         if not self._load_dynamics(psspy, sav_path):
             logger.error(
                 "  Skipping contingency '%s': dynamics could not be loaded.",
@@ -552,61 +667,38 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 5: Set up output channels ───────────────────────────────────
-        output_file = os.path.join(
-            os.path.dirname(sav_path),
-            f"ts_{self.scenario}_{_safe_filename(cont.contingency_name)}.out"
-        )
-
-        psspy.delete_all_plot_channels()
-
-        # POI bus voltage channel
-        if poi_bus:
-            ret  = psspy.voltage_channel([-1, -1, -1, poi_bus], "Bus Voltage POI")
-            ierr = _ierr(ret)
-            if ierr != 0:
-                logger.warning(
-                    "  Could not add voltage channel for POI bus %d (ierr=%d).",
-                    poi_bus, ierr,
-                )
-
-        # Rotor angle channels for all generators.
-        # psspy.machine_array_channel([subsystem, ITYPE, bus], id, label)
-        #   ITYPE=1  →  rotor angle (degrees, relative to COI reference)
-        try:
-            ierr,  (gen_buses,) = psspy.amachint(-1, 4, ["NUMBER"])
-            ierr2, (gen_ids,)   = psspy.amachchar(-1, 4, ["ID"])
-            for i, gbus in enumerate(gen_buses):
-                gid = gen_ids[i].strip() if gen_ids else "1"
-                ret_ch  = psspy.machine_array_channel(
-                    [-1, 1, gbus],
-                    gid,
-                    f"Rotor Angle Bus {gbus}",
-                )
-                ierr_ch = _ierr(ret_ch)
-                if ierr_ch != 0:
-                    logger.debug(
-                        "  machine_array_channel ierr=%d for gen at bus %d.",
-                        ierr_ch, gbus,
-                    )
-        except Exception as exc:
-            logger.debug("  Generator channel setup: %s", exc)
+        # ── Step 5: Define output channels ───────────────────────────────────
+        # PSS/E REQUIRES channels to be registered BEFORE strt().
+        # Channels added after strt() are silently ignored, and calling run()
+        # without a successful strt() raises PSS/E message 003538:
+        #   "Activity RUN is invalid — activity STRT needs to be executed"
+        output_file = self._setup_channels(psspy, sav_path, poi_bus)
+        logger.debug("  Output file: %s", output_file)
 
         # ── Step 6: Initialise dynamics ───────────────────────────────────────
+        # strt() must succeed before any run() call.
+        # Failure here is FATAL for this contingency — we must NOT call run()
+        # with an uninitialised simulation (that triggers message 003538).
         ret  = psspy.strt(0, output_file)
         ierr = _ierr(ret)
         if ierr != 0:
-            logger.warning(
-                "  psspy.strt() failed (ierr=%d) for '%s'.",
-                ierr, cont.contingency_name
+            logger.error(
+                "  psspy.strt() failed (ierr=%d) for '%s'. "
+                "Cannot proceed to run() without a valid simulation session.",
+                ierr, cont.contingency_name,
             )
-            return result
+            return result   # ← early return prevents 003538 on run()
+
+        logger.debug("  strt() succeeded for '%s'.", cont.contingency_name)
 
         # ── Step 7: Run to fault application time ─────────────────────────────
         ret  = psspy.run(0, self.fault_apply_time_s, 1000, 1, 0)
         ierr = _ierr(ret)
         if ierr != 0:
-            logger.warning("  Pre-fault simulation failed (ierr=%d).", ierr)
+            logger.warning(
+                "  Pre-fault run() failed (ierr=%d) for '%s'.",
+                ierr, cont.contingency_name,
+            )
             return result
 
         # ── Step 8: Apply bolted 3-phase fault ────────────────────────────────
@@ -615,7 +707,7 @@ class TransientStabilityStudy:
             logger.warning(
                 "  No fault bus defined for '%s'. "
                 "Fill From Bus No in TS_Contingencies sheet.",
-                cont.contingency_name
+                cont.contingency_name,
             )
             return result
 
@@ -623,7 +715,8 @@ class TransientStabilityStudy:
         ierr = _ierr(ret)
         if ierr != 0:
             logger.warning(
-                "  dist_bus_fault failed (ierr=%d) at bus %d.", ierr, fault_bus
+                "  dist_bus_fault failed (ierr=%d) at bus %d.",
+                ierr, fault_bus,
             )
 
         # ── Step 9: Run during-fault ──────────────────────────────────────────
@@ -748,7 +841,7 @@ class TransientStabilityStudy:
             logger.warning(
                 "  POI bus voltage channel not available for '%s'. "
                 "Voltage recovery cannot be assessed.",
-                result.contingency_name
+                result.contingency_name,
             )
 
     # ── Private: plots ────────────────────────────────────────────────────────
