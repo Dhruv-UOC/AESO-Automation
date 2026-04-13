@@ -5,19 +5,21 @@ Automates AESO Transient Stability Analysis (Phase 3) using PSS/E via psspy.
 
 Workflow
 --------
-1.  Load base case (.sav) — dynamics already embedded in the saved state
-2.  Solve base case Newton-Raphson power flow
-3.  Initialise dynamic simulation (psspy.strt)
+1.  Load base case (.sav) — power flow snapshot
+2.  Load dynamic models (.dyr) — machine models, AVRs, PSS, etc.
+3.  Solve base case Newton-Raphson power flow
 4.  For each contingency in TS_Contingencies:
     a. Reload fresh .sav
-    b. Re-initialise dynamics
-    c. Run pre-fault simulation to steady state (t=0 to fault_apply_time)
-    d. Apply bolted 3-phase fault at contingency bus
-    e. Run during-fault simulation (fault_apply_time to fault_clear_time)
-    f. Clear fault (restore branch)
-    g. Run post-fault simulation (fault_clear_time to sim_end)
-    h. Extract channel data: bus voltages, rotor angles, active/reactive power
-    i. Check AESO criteria: rotor angle stability, voltage recovery
+    b. Reload .dyr (dynamics must be re-loaded after each psspy.case() call)
+    c. Set up output channels (voltage, rotor angle, active/reactive power)
+    d. Initialise dynamic simulation (psspy.strt)
+    e. Run pre-fault simulation to steady state (t=0 to fault_apply_time)
+    f. Apply bolted 3-phase fault at contingency bus
+    g. Run during-fault simulation (fault_apply_time to fault_clear_time)
+    h. Clear fault (restore branch)
+    i. Run post-fault simulation (fault_clear_time to sim_end)
+    j. Extract channel data: bus voltages, rotor angles, active/reactive power
+    k. Check AESO criteria: rotor angle stability, voltage recovery
 5.  Export results to Excel + multi-panel PNG plots + PDF report
 
 AESO Criteria Applied (Study Scope Section 5.3 and Requirements doc Section 3.4)
@@ -30,7 +32,8 @@ AESO Criteria Applied (Study Scope Section 5.3 and Requirements doc Section 3.4)
 - Monitor: 500 kV, 240 kV, 138 kV buses near point of connection
 - Monitor: rotor angle, active power, reactive power for study area generators
 - Fault clearing times: from Table 4-8 / Table 4-14 in Study Scope (per contingency)
-- Dynamic models: embedded in .sav file (no separate .dyr file required)
+- Dynamic models: loaded from .dyr file (must be co-located with .sav or set explicitly
+  via ProjectInfo.dyr_file_path)
 
 Usage
 -----
@@ -64,7 +67,7 @@ from project_io.project_data import ProjectData, TSContingency
 
 logger = logging.getLogger(__name__)
 
-# ── AESO colour palette ───────────────────────────────────────────────────────
+# ── AESO colour palette ───────────────────────────────────────────────────────────────────
 _BLUE   = "#003865"
 _RED    = "#C8102E"
 _ORANGE = "#E87722"
@@ -87,7 +90,7 @@ plt.rcParams.update({
 })
 
 
-# ── Data containers ───────────────────────────────────────────────────────────
+# ── Data containers ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class ChannelData:
@@ -143,7 +146,7 @@ class TransientStabilityResults:
         return sum(1 for c in self.contingencies if not c.aeso_pass)
 
 
-# ── Study class ───────────────────────────────────────────────────────────────
+# ── Study class ───────────────────────────────────────────────────────────────────
 
 class TransientStabilityStudy:
     """
@@ -203,7 +206,7 @@ class TransientStabilityStudy:
         Parameters
         ----------
         sav_path : str
-            Path to the .sav case file with embedded dynamics.
+            Path to the .sav case file.
 
         Returns
         -------
@@ -304,7 +307,62 @@ class TransientStabilityStudy:
 
         return {"excel": excel_path, "plots": plot_paths, "pdf": pdf_path}
 
-    # ── Private: PSS/E transient stability engine ─────────────────────────────
+    # ── Private: PSS/E transient stability engine ─────────────────────────────────
+
+    def _load_dynamics(self, psspy, sav_path: str) -> bool:
+        """
+        Load the .dyr dynamic data file into PSS/E memory.
+
+        Must be called after every psspy.case() call because loading a new
+        .sav clears all previously loaded dynamic models from memory.
+        PSS/E API call: psspy.dyre_new() reads a .dyr file and registers
+        all machine, exciter, governor, and PSS models.
+
+        Resolution order for the .dyr path (via ProjectData.resolve_dyr_path):
+          1. info.dyr_file_path  — explicit path in Project_Info sheet / GUI
+          2. sav_path with .sav replaced by .dyr  — co-located file
+
+        Parameters
+        ----------
+        psspy : module
+            The active psspy module from PSSEInterface.
+        sav_path : str
+            Path to the .sav file just loaded (used as a fallback base path).
+
+        Returns
+        -------
+        bool
+            True if dynamics loaded successfully, False otherwise.
+        """
+        dyr_path = self._project.resolve_dyr_path()
+
+        # If resolve_dyr_path() returned empty or the project-level path is
+        # empty, fall back to deriving from the per-contingency sav_path.
+        if not dyr_path or not os.path.isfile(dyr_path):
+            dyr_path = os.path.splitext(sav_path)[0] + ".dyr"
+
+        if not os.path.isfile(dyr_path):
+            logger.error(
+                "  .dyr file not found. Dynamics cannot be loaded. "
+                "Set 'DYR File Path' in Project_Info or place a .dyr file "
+                "alongside the .sav file. Checked: '%s'",
+                dyr_path,
+            )
+            return False
+
+        # psspy.dyre_new([iflags], dyrfile, ldyfile, logfile, status)
+        # iflags=[0,0,0,0]: use defaults for all options
+        # Empty strings for ldyfile/logfile: no separate load/log files
+        ierr = psspy.dyre_new([0, 0, 0, 0], dyr_path, "", "", "")
+        if ierr != 0:
+            logger.error(
+                "  psspy.dyre_new() failed (ierr=%d) for .dyr file: '%s'.",
+                ierr, dyr_path,
+            )
+            return False
+
+        logger.debug("  Dynamics loaded from: %s", dyr_path)
+        return True
 
     def _run_contingency(
         self,
@@ -337,13 +395,25 @@ class TransientStabilityStudy:
         psspy = self._psse.psspy
         poi_bus = self._project.info.poi_bus_number
 
-        # ── Step 1: Load fresh case ────────────────────────────────────────
+        # ── Step 1: Load fresh case ─────────────────────────────────────────
         ierr = psspy.case(sav_path)
         if ierr != 0:
             logger.error("  Failed to load case for '%s'.", cont.contingency_name)
             return result
 
-        # ── Step 2: Solve base power flow ──────────────────────────────────
+        # ── Step 2: Load dynamic models (.dyr) ──────────────────────────────
+        # MUST be done after psspy.case() and before psspy.strt().
+        # psspy.case() loads power flow data only; dynamic models are cleared
+        # from memory each time a new .sav is loaded. Without this step,
+        # psspy.strt() will fail with ierr=5 ("No dynamics data in memory").
+        if not self._load_dynamics(psspy, sav_path):
+            logger.error(
+                "  Skipping contingency '%s': dynamics could not be loaded.",
+                cont.contingency_name,
+            )
+            return result
+
+        # ── Step 3: Solve base power flow ───────────────────────────────────
         ret = psspy.fnsl([1, 0, 1, 1, 1, 0, 0, 0])
         result.converged_base = (ret == 0)
         if not result.converged_base:
@@ -353,12 +423,11 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 3: Set up output channels ────────────────────────────────
-        # Channel setup must be done BEFORE psspy.strt
+        # ── Step 4: Set up output channels ───────────────────────────────────
+        # Channel setup must be done BEFORE psspy.strt().
         # We set up channels for:
         #   - POI bus voltage (if poi_bus is known)
-        #   - All 240kV and 138kV buses near POC
-        #   - Generator rotor angles (relative to reference)
+        #   - Generator rotor angles (relative to system COI reference)
         #   - Active and reactive power at POI
         output_file = os.path.join(
             os.path.dirname(sav_path),
@@ -376,25 +445,35 @@ class TransientStabilityStudy:
                     "  Could not add voltage channel for POI bus %d.", poi_bus
                 )
 
-        # Add rotor angle channels for generators in study area
-        # Using machines API to get generator list
+        # Add rotor angle channels for generators in study area.
+        # FIX: psspy.angle_channel() does not exist in the PSS/E Python API.
+        # The correct function is psspy.machine_array_channel():
+        #   - ITYPE=1 requests the rotor angle output (degrees relative to
+        #     the system centre-of-inertia reference)
+        #   - Parameters: [subsystem, ITYPE, bus_number], machine_id, label
         try:
             ierr, (gen_buses,) = psspy.amachint(-1, 4, ["NUMBER"])
             ierr2, (gen_ids,)  = psspy.amachchar(-1, 4, ["ID"])
             for i, gbus in enumerate(gen_buses):
                 gid = gen_ids[i].strip() if gen_ids else "1"
-                ierr_ch = psspy.angle_channel(
-                    [-1, -1, -1, gbus],
-                    r"""{}""".format(gid),
+                ierr_ch = psspy.machine_array_channel(
+                    [-1, 1, gbus],          # subsystem=-1 (all), ITYPE=1 (angle), bus
+                    gid,                    # machine ID string
                     f"Rotor Angle Bus {gbus}",
                 )
+                if ierr_ch != 0:
+                    logger.debug(
+                        "  Could not add rotor angle channel for gen at bus %d "
+                        "(machine_array_channel ierr=%d).",
+                        gbus, ierr_ch,
+                    )
         except Exception as exc:
             logger.debug("  Generator channel setup: %s", exc)
 
-        # ── Step 4: Initialise dynamics ────────────────────────────────────
-        # psspy.strt: start dynamic simulation
-        # Parameters: [units, ..., output_file]
-        # units=1 → output in per unit
+        # ── Step 5: Initialise dynamics ───────────────────────────────────────
+        # psspy.strt() initialises the dynamic simulation and writes the
+        # output file header. It requires dynamic models to already be in
+        # memory (loaded in Step 2 above). units=0 → output in per unit.
         ierr = psspy.strt(0, output_file)
         if ierr != 0:
             logger.warning(
@@ -403,7 +482,7 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 5: Run to fault application time ─────────────────────────
+        # ── Step 6: Run to fault application time ──────────────────────────
         ierr = psspy.run(0, self.fault_apply_time_s, 1000, 1, 0)
         if ierr != 0:
             logger.warning(
@@ -411,7 +490,7 @@ class TransientStabilityStudy:
             )
             return result
 
-        # ── Step 6: Apply 3-phase fault ────────────────────────────────────
+        # ── Step 7: Apply 3-phase fault ───────────────────────────────────────
         fault_bus = cont.from_bus_no
         if fault_bus is None:
             logger.warning(
@@ -430,10 +509,10 @@ class TransientStabilityStudy:
                 ierr, fault_bus
             )
 
-        # ── Step 7: Run during-fault ───────────────────────────────────────
+        # ── Step 8: Run during-fault ────────────────────────────────────────
         ierr = psspy.run(0, fault_clear_time_s, 1000, 1, 0)
 
-        # ── Step 8: Clear fault (open branch) ─────────────────────────────
+        # ── Step 9: Clear fault (open branch) ──────────────────────────────
         # Remove fault
         ierr_cf = psspy.dist_clear_fault(1)
 
@@ -445,15 +524,15 @@ class TransientStabilityStudy:
                 cont.circuit_id,
             )
 
-        # ── Step 9: Run post-fault simulation ─────────────────────────────
+        # ── Step 10: Run post-fault simulation ─────────────────────────────
         ierr = psspy.run(0, self.sim_duration_s, 10000, 1, 0)
         result.sim_completed = (ierr == 0)
 
-        # ── Step 10: Extract channel data ──────────────────────────────────
+        # ── Step 11: Extract channel data ───────────────────────────────────
         channels = self._extract_channels(psspy, output_file, poi_bus)
         result.channels = channels
 
-        # ── Step 11: Evaluate AESO criteria ───────────────────────────────
+        # ── Step 12: Evaluate AESO criteria ────────────────────────────────
         self._evaluate_criteria(result, poi_bus)
 
         return result
@@ -555,7 +634,7 @@ class TransientStabilityStudy:
                 result.contingency_name
             )
 
-    # ── Private: plots ────────────────────────────────────────────────────────
+    # ── Private: plots ────────────────────────────────────────────────────────────
 
     def _plot_contingency(
         self,
@@ -653,7 +732,7 @@ class TransientStabilityStudy:
         logger.info("Plot saved: %s", path)
         return path
 
-    # ── Private: PDF export ───────────────────────────────────────────────────
+    # ── Private: PDF export ──────────────────────────────────────────────────────
 
     def _export_pdf(self, pdf_path: str, plot_paths: List[str]) -> None:
         """Assemble PDF: plots + compliance summary table."""
@@ -708,7 +787,7 @@ class TransientStabilityStudy:
             d["Author"]       = "AESO Automation Tool"
             d["CreationDate"] = datetime.now()
 
-    # ── Private: DataFrame builders ───────────────────────────────────────────
+    # ── Private: DataFrame builders ───────────────────────────────────────────────
 
     def _summary_to_df(self) -> pd.DataFrame:
         r = self.results
@@ -759,7 +838,7 @@ class TransientStabilityStudy:
 
         return pd.DataFrame(data)
 
-    # ── Mock data ─────────────────────────────────────────────────────────────
+    # ── Mock data ───────────────────────────────────────────────────────────────────
 
     def _mock_contingency_result(
         self,
